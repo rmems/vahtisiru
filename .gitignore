@@ -4,7 +4,10 @@ target/
 .mimocode/
 .codex/
 .kilo/
-.cursor/
+.cursor/*
+# Cursor Cloud Agent environment: committed on purpose.
+!.cursor/environment.json
+!.cursor/install.sh
 .zed/
 .vscode/
 .claude/
