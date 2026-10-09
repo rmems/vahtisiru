@@ -1,29 +1,34 @@
-//! Canonical hardware-telemetry CSV interchange contract.
+//! Canonical hardware-telemetry CSV interchange contract, as a standalone
+//! crate ([RM-1905](https://linear.app/rpd-34/issue/RM-1905)).
 //!
 //! One-way copy of the reader/validator semantics from
 //! `corinth-canal` `examples/support/telemetry_csv.rs`
 //! ([RM-629](https://linear.app/rpd-34/issue/RM-629) /
 //! [corinth-canal#160](https://github.com/rmems/corinth-canal/issues/160)).
 //! There is **no** Cargo dependency in either direction; corinth keeps its
-//! example-support copy as a reference consumer, and the two copies may
-//! diverge. Corinth's env-truth surface (`examples/support/config.rs`) is
-//! not copied here.
+//! example-support copy as a reference consumer, and the copies may diverge.
+//! Corinth's env-truth surface (`examples/support/config.rs`) is not copied
+//! here.
 //!
 //! Schema is **frozen**. Do not add, remove, or rename columns.
 //!
 //! This is the interchange format corinth ingests. It is not the live NVML
-//! sample contract in [`crate::telemetry`]: CSV fields are required finite
-//! numbers (missing sensors are malformed rows, not `None`), `gpu_power_w`
-//! is the CSV name for live `power_w`, and CPU Tctl / package power are
-//! CSV columns this relay does not currently acquire.
+//! sample contract (`vahtisiru::telemetry` in the relay crate): CSV fields
+//! are required finite numbers (missing sensors are malformed rows, not
+//! `None`), `gpu_power_w` is the CSV name for live `power_w`, and CPU Tctl /
+//! package power are CSV columns the relay does not currently acquire.
 //!
-//! Contract: [`docs/telemetry_csv.md`](../docs/telemetry_csv.md).
+//! This crate has **no dependencies**: it requires no NVML, NVIDIA hardware,
+//! privileged commands, or the relay supervisor. The companion
+//! `vahtisiru-telemetry-csv` binary wraps the same semantics for CI and
+//! non-Rust producers.
 //!
-//! The standalone contract-only package `vahtisiru-telemetry-csv` (workspace
-//! member `telemetry-csv/`, plus the `vahtisiru-telemetry-csv` validator CLI)
-//! ships the same semantics without the relay dependencies for producers and
-//! CI ([RM-1905](https://linear.app/rpd-34/issue/RM-1905)). The copies are
-//! kept in lockstep by `telemetry-csv/tests/parity.rs`.
+//! Contract:
+//! `docs/telemetry_csv.md` in <https://github.com/rmems/vahtisiru>.
+
+#![deny(missing_docs)]
+#![deny(rustdoc::broken_intra_doc_links)]
+#![doc(test(attr(deny(unused))))]
 
 use std::fmt;
 use std::io;
@@ -278,206 +283,4 @@ pub fn format_csv(rows: &[TelemetryCsvRow]) -> String {
         out.push('\n');
     }
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn test_scratch_dir() -> PathBuf {
-        if let Some(dir) = std::env::var_os("CARGO_TARGET_TMPDIR") {
-            return PathBuf::from(dir);
-        }
-        let dir = PathBuf::from("target").join("tmp-tests");
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    fn write_temp_csv(name: &str, contents: &str) -> PathBuf {
-        let path = test_scratch_dir().join(format!(
-            "vahtisiru_telemetry_csv_{}_{}.csv",
-            name,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::write(&path, contents).unwrap();
-        path
-    }
-
-    #[test]
-    fn header_is_the_frozen_five_column_string() {
-        assert_eq!(
-            HEADER,
-            "timestamp_ms,gpu_temp_c,gpu_power_w,cpu_tctl_c,cpu_package_power_w"
-        );
-        assert_eq!(HEADER.split(',').count(), FIELD_COUNT);
-    }
-
-    #[test]
-    fn load_csv_accepts_canonical_header_and_parses_rows() {
-        let csv = "timestamp_ms,gpu_temp_c,gpu_power_w,cpu_tctl_c,cpu_package_power_w\n\
-                   1000,60.5,250.0,70.0,120.0\n\
-                   2000,61.0,252.5,70.5,121.5\n";
-        let path = write_temp_csv("canonical", csv);
-        let loaded = load_csv(&path).unwrap();
-        assert_eq!(loaded.rows.len(), 2);
-        assert_eq!(loaded.skipped, 0);
-        assert_eq!(loaded.rows[0].timestamp_ms, 1000);
-        assert!((loaded.rows[0].gpu_temp_c - 60.5).abs() < 1e-6);
-        assert_eq!(loaded.rows[1].timestamp_ms, 2000);
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn load_csv_rejects_bad_header() {
-        let csv = "t,gpu,gpuw,cpu,cpuw\n1000,60,250,70,120\n";
-        let path = write_temp_csv("bad_header", csv);
-        let err = load_csv(&path).unwrap_err();
-        assert!(err.to_string().contains("header mismatch"));
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn load_csv_rejects_session_label_extension_as_header_mismatch() {
-        // gaming-telemetry currently appends session_label; that is not this
-        // frozen schema. Exact-match header validation must fail closed.
-        let csv = "timestamp_ms,gpu_temp_c,gpu_power_w,cpu_tctl_c,cpu_package_power_w,session_label\n\
-                   1000,60.5,250.0,70.0,120.0,kcd2\n";
-        let err = parse_csv(csv).unwrap_err();
-        assert!(err.to_string().contains("header mismatch"));
-    }
-
-    #[test]
-    fn load_csv_skips_malformed_short_rows() {
-        let csv = "timestamp_ms,gpu_temp_c,gpu_power_w,cpu_tctl_c,cpu_package_power_w\n\
-                   1000,60.5,250.0,70.0,120.0\n\
-                   malformed,row\n\
-                   2000,NaN,250.0,70.0,120.0\n\
-                   3000,61.0,252.5,70.5,121.5\n";
-        let path = write_temp_csv("skip_bad", csv);
-        let loaded = load_csv(&path).unwrap();
-        assert_eq!(
-            loaded.rows.len(),
-            2,
-            "expected only the two fully-valid rows"
-        );
-        assert_eq!(loaded.skipped, 2);
-        assert_eq!(loaded.rows[0].timestamp_ms, 1000);
-        assert_eq!(loaded.rows[1].timestamp_ms, 3000);
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn load_csv_skips_non_numeric_fields() {
-        let csv = "timestamp_ms,gpu_temp_c,gpu_power_w,cpu_tctl_c,cpu_package_power_w\n\
-                   1000,abc,250.0,70.0,120.0\n\
-                   not_a_ts,60.5,250.0,70.0,120.0\n\
-                   2000,61.0,252.5,70.5,121.5\n";
-        let loaded = parse_csv(csv).unwrap();
-        assert_eq!(loaded.rows.len(), 1);
-        assert_eq!(loaded.skipped, 2);
-        assert_eq!(loaded.rows[0].timestamp_ms, 2000);
-    }
-
-    #[test]
-    fn load_csv_skips_non_finite_and_extra_columns() {
-        let csv = "timestamp_ms,gpu_temp_c,gpu_power_w,cpu_tctl_c,cpu_package_power_w\n\
-                   1000,inf,250.0,70.0,120.0\n\
-                   1100,-inf,250.0,70.0,120.0\n\
-                   1200,60.5,250.0,70.0,120.0,extra\n\
-                   1300,60.5,250.0,70.0,120.0\n";
-        let loaded = parse_csv(csv).unwrap();
-        assert_eq!(loaded.rows.len(), 1);
-        assert_eq!(loaded.skipped, 3);
-        assert_eq!(loaded.rows[0].timestamp_ms, 1300);
-    }
-
-    #[test]
-    fn empty_lines_are_not_counted_as_skipped() {
-        let csv = "timestamp_ms,gpu_temp_c,gpu_power_w,cpu_tctl_c,cpu_package_power_w\n\
-                   \n\
-                   1000,60.5,250.0,70.0,120.0\n\
-                   \n";
-        let loaded = parse_csv(csv).unwrap();
-        assert_eq!(loaded.rows.len(), 1);
-        assert_eq!(loaded.skipped, 0);
-    }
-
-    #[test]
-    fn empty_file_is_an_error() {
-        let err = parse_csv("").unwrap_err();
-        assert!(err.to_string().contains("is empty"));
-    }
-
-    #[test]
-    fn header_only_is_valid_but_has_no_usable_rows() {
-        let loaded = parse_csv(HEADER).unwrap();
-        assert!(loaded.rows.is_empty());
-        assert!(!loaded.has_usable_rows());
-        assert_eq!(loaded.skipped, 0);
-    }
-
-    #[test]
-    fn missing_file_is_io_error() {
-        let path = test_scratch_dir().join("vahtisiru_telemetry_csv_does_not_exist.csv");
-        let err = load_csv(&path).unwrap_err();
-        assert!(err.to_string().contains("could not be read"));
-    }
-
-    #[test]
-    fn row_for_tick_wraps_around_and_rewrites_timestamp() {
-        let rows = vec![
-            TelemetryCsvRow {
-                timestamp_ms: 111,
-                gpu_temp_c: 10.0,
-                gpu_power_w: 100.0,
-                cpu_tctl_c: 20.0,
-                cpu_package_power_w: 200.0,
-            },
-            TelemetryCsvRow {
-                timestamp_ms: 222,
-                gpu_temp_c: 30.0,
-                gpu_power_w: 300.0,
-                cpu_tctl_c: 40.0,
-                cpu_package_power_w: 400.0,
-            },
-        ];
-        let snap0 = row_for_tick(0, &rows).unwrap();
-        let snap3 = row_for_tick(3, &rows).unwrap();
-        assert!((snap0.gpu_temp_c - 10.0).abs() < 1e-6);
-        assert!((snap3.gpu_temp_c - 30.0).abs() < 1e-6);
-        assert_eq!(snap0.timestamp_ms, 1);
-        assert_eq!(snap3.timestamp_ms, 4);
-    }
-
-    #[test]
-    fn row_for_tick_empty_is_none() {
-        assert!(row_for_tick(0, &[]).is_none());
-    }
-
-    #[test]
-    fn format_csv_round_trips_through_parse() {
-        let rows = [TelemetryCsvRow {
-            timestamp_ms: 1000,
-            gpu_temp_c: 60.5,
-            gpu_power_w: 250.0,
-            cpu_tctl_c: 70.0,
-            cpu_package_power_w: 120.0,
-        }];
-        let loaded = parse_csv(&format_csv(&rows)).unwrap();
-        assert_eq!(loaded.skipped, 0);
-        assert_eq!(loaded.rows[0].timestamp_ms, 1000);
-        assert!((loaded.rows[0].gpu_temp_c - 60.5).abs() < 1e-6);
-        assert!((loaded.rows[0].gpu_power_w - 250.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn trimmed_header_whitespace_is_accepted() {
-        let csv = "  timestamp_ms,gpu_temp_c,gpu_power_w,cpu_tctl_c,cpu_package_power_w  \n\
-                    1000,60.5,250.0,70.0,120.0\n";
-        let loaded = parse_csv(csv).unwrap();
-        assert_eq!(loaded.rows.len(), 1);
-    }
 }

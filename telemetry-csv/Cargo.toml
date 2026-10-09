@@ -1,0 +1,31 @@
+[package]
+name = "vahtisiru-telemetry-csv"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+authors = ["Raul Cardenas Montoya"]
+description = "Standalone, software-only validator for the frozen hardware-telemetry CSV contract (corinth ingest). No NVML, GPU, or supervisor required."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rmems/vahtisiru"
+homepage = "https://github.com/rmems/vahtisiru"
+documentation = "https://docs.rs/vahtisiru-telemetry-csv"
+readme = "README.md"
+keywords = ["telemetry", "csv", "validation", "contract"]
+categories = ["parsing", "command-line-utilities"]
+publish = ["crates-io"]
+include = [
+    "Cargo.toml",
+    "README.md",
+    "LICENSE-APACHE-2.0",
+    "LICENSE-MIT",
+    "src/**",
+]
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs", "-D", "warnings"]
+
+[dependencies]
+
+[[bin]]
+name = "vahtisiru-telemetry-csv"
+path = "src/main.rs"
