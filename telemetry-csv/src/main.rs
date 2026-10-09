@@ -41,7 +41,20 @@ struct Args {
     path: String,
 }
 
-fn parse_args(argv: &[String]) -> Result<Option<Args>, String> {
+/// A usage error. Carries the `json` flag recognized before the failure so
+/// `--json` consumers still get a JSON result.
+struct UsageError {
+    message: String,
+    json: bool,
+}
+
+impl std::fmt::Display for UsageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+fn parse_args(argv: &[String]) -> Result<Option<Args>, UsageError> {
     let mut json = false;
     let mut path: Option<String> = None;
     for arg in argv {
@@ -49,11 +62,19 @@ fn parse_args(argv: &[String]) -> Result<Option<Args>, String> {
             "--json" => json = true,
             "-h" | "--help" => return Ok(None),
             _ if path.is_none() => path = Some(arg.clone()),
-            _ => return Err(format!("unexpected argument '{arg}'")),
+            _ => {
+                return Err(UsageError {
+                    message: format!("unexpected argument '{arg}'"),
+                    json,
+                });
+            }
         }
     }
     let Some(path) = path else {
-        return Err("missing PATH argument".to_string());
+        return Err(UsageError {
+            message: "missing PATH argument".to_string(),
+            json,
+        });
     };
     Ok(Some(Args { json, path }))
 }
@@ -155,10 +176,10 @@ fn main() -> ExitCode {
         }
         Err(err) => {
             // --json consumers get a JSON result even for usage errors.
-            if argv.iter().any(|a| a == "--json") {
+            if err.json {
                 println!(
                     "{{\"input\":\"<args>\",\"status\":\"error\",\"rows\":0,\"skipped\":0,\"error\":\"{}\"}}",
-                    json_escape(&err)
+                    json_escape(&err.message)
                 );
             } else {
                 eprintln!("vahtisiru-telemetry-csv: {err}\n{USAGE}");
