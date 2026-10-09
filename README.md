@@ -397,6 +397,19 @@ A separate frozen **CSV interchange** for corinth-canal ingest lives in
 Producers should validate against that module before publishing a file
 corinth will read. The CSV schema is frozen; do not add columns.
 
+For producers and CI that should not link the relay crate, the workspace
+member [`telemetry-csv/`](telemetry-csv/) ships the same contract as the
+zero-dependency `vahtisiru-telemetry-csv` crate plus a validator CLI:
+
+```console
+$ vahtisiru-telemetry-csv samples.csv        # or `-` for stdin, `--json`
+samples.csv: ok — 2 valid row(s), 0 malformed row(s) skipped
+```
+
+Exit codes: `0` valid with usable rows, `1` contract failure (empty,
+header mismatch, no usable rows), `2` I/O/usage error. See
+[`telemetry-csv/README.md`](telemetry-csv/README.md).
+
 | Signal | Class | Notes |
 | --- | --- | --- |
 | `gpu_temp_c`, `power_w` | safety + runtime-input | Missing/invalid/stale fail closed |

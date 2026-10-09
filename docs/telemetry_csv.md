@@ -63,6 +63,37 @@ Producers should call `parse_csv` / `load_csv` (or `format_csv` then
 `parse_csv`) and require `LoadResult::has_usable_rows()` before publishing
 a file for corinth ingest.
 
+## Standalone validator (`vahtisiru-telemetry-csv`)
+
+For producers and CI that cannot (or should not) link the full relay crate —
+no NVML, NVIDIA hardware, privileged commands, or supervisor — the workspace
+member [`telemetry-csv/`](../telemetry-csv/) packages the same semantics as a
+zero-dependency crate, `vahtisiru-telemetry-csv`, plus a validator binary of
+the same name ([RM-1905](https://linear.app/rpd-34/issue/RM-1905)).
+
+```console
+$ vahtisiru-telemetry-csv samples.csv
+samples.csv: ok — 2 valid row(s), 0 malformed row(s) skipped
+
+$ cat samples.csv | vahtisiru-telemetry-csv -        # stdin
+
+$ vahtisiru-telemetry-csv --json broken.csv          # machine-readable
+{"input":"broken.csv","status":"error","rows":0,"skipped":0,"error":"telemetry CSV 'broken.csv' header mismatch: expected '...', got '...'"}
+```
+
+Exit status is stable for CI use:
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Contract-valid input with at least one usable row |
+| `1` | Contract failure: empty input, header mismatch, or no usable rows |
+| `2` | I/O or usage error: unreadable file, bad arguments |
+
+Malformed data rows stay permissive-skipped (not fatal) and are reported in
+the `skipped` count — the validator does not tighten the reader contract.
+This crate is the canonical standalone copy; `src/telemetry_csv.rs` in the
+relay is kept in lockstep by `telemetry-csv/tests/parity.rs`.
+
 ## What this crate does not copy
 
 - Corinth `TelemetrySource::{Synthetic, Csv}` and `synthetic_fallback`

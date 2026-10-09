@@ -60,3 +60,5 @@ name = "vahtisiru"
 path = "src/main.rs"
 
 [workspace]
+members = [".", "telemetry-csv"]
+default-members = [".", "telemetry-csv"]

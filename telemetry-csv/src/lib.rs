@@ -1,29 +1,34 @@
-//! Canonical hardware-telemetry CSV interchange contract.
+//! Canonical hardware-telemetry CSV interchange contract, as a standalone
+//! crate ([RM-1905](https://linear.app/rpd-34/issue/RM-1905)).
 //!
 //! One-way copy of the reader/validator semantics from
 //! `corinth-canal` `examples/support/telemetry_csv.rs`
 //! ([RM-629](https://linear.app/rpd-34/issue/RM-629) /
 //! [corinth-canal#160](https://github.com/rmems/corinth-canal/issues/160)).
 //! There is **no** Cargo dependency in either direction; corinth keeps its
-//! example-support copy as a reference consumer, and the two copies may
-//! diverge. Corinth's env-truth surface (`examples/support/config.rs`) is
-//! not copied here.
+//! example-support copy as a reference consumer, and the copies may diverge.
+//! Corinth's env-truth surface (`examples/support/config.rs`) is not copied
+//! here.
 //!
 //! Schema is **frozen**. Do not add, remove, or rename columns.
 //!
 //! This is the interchange format corinth ingests. It is not the live NVML
-//! sample contract in [`crate::telemetry`]: CSV fields are required finite
-//! numbers (missing sensors are malformed rows, not `None`), `gpu_power_w`
-//! is the CSV name for live `power_w`, and CPU Tctl / package power are
-//! CSV columns this relay does not currently acquire.
+//! sample contract (`vahtisiru::telemetry` in the relay crate): CSV fields
+//! are required finite numbers (missing sensors are malformed rows, not
+//! `None`), `gpu_power_w` is the CSV name for live `power_w`, and CPU Tctl /
+//! package power are CSV columns the relay does not currently acquire.
 //!
-//! Contract: [`docs/telemetry_csv.md`](../docs/telemetry_csv.md).
+//! This crate has **no dependencies**: it requires no NVML, NVIDIA hardware,
+//! privileged commands, or the relay supervisor. The companion
+//! `vahtisiru-telemetry-csv` binary wraps the same semantics for CI and
+//! non-Rust producers.
 //!
-//! The standalone contract-only package `vahtisiru-telemetry-csv` (workspace
-//! member `telemetry-csv/`, plus the `vahtisiru-telemetry-csv` validator CLI)
-//! ships the same semantics without the relay dependencies for producers and
-//! CI ([RM-1905](https://linear.app/rpd-34/issue/RM-1905)). The copies are
-//! kept in lockstep by `telemetry-csv/tests/parity.rs`.
+//! Contract:
+//! `docs/telemetry_csv.md` in <https://github.com/rmems/vahtisiru>.
+
+#![deny(missing_docs)]
+#![deny(rustdoc::broken_intra_doc_links)]
+#![doc(test(attr(deny(unused))))]
 
 use std::fmt;
 use std::io;

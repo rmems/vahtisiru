@@ -214,3 +214,23 @@ jobs:
       # A real `cargo publish` (without --dry-run) must remain a maintainer action.
       - name: cargo publish --dry-run --locked
         run: cargo publish --dry-run --locked
+
+      # Standalone telemetry-CSV contract package (telemetry-csv/,
+      # RM-1905). Same qualification shape as the main crate: package,
+      # no path deps, and a packaged-source test outside the repo.
+      - name: cargo package --locked (telemetry-csv)
+        run: cargo package --locked -p vahtisiru-telemetry-csv
+
+      - name: Smoke-test packaged telemetry-csv source outside the repository
+        run: |
+          set -euo pipefail
+          crate="$(find target/package -name 'vahtisiru-telemetry-csv-*.crate' | sort -V | tail -1)"
+          test -f "${crate}"
+          smoke_dir="$(mktemp -d)"
+          tar -C "${smoke_dir}" -xzf "${crate}"
+          packaged="$(find "${smoke_dir}" -maxdepth 1 -type d -name 'vahtisiru-telemetry-csv-*' | head -1)"
+          test -d "${packaged}"
+          (cd "${packaged}" && cargo test --locked --all-features)
+
+      - name: cargo publish --dry-run --locked (telemetry-csv)
+        run: cargo publish --dry-run --locked -p vahtisiru-telemetry-csv
