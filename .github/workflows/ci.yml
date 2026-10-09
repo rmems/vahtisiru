@@ -232,5 +232,6 @@ jobs:
           test -d "${packaged}"
           (cd "${packaged}" && cargo test --locked --all-features)
 
-      - name: cargo publish --dry-run --locked (telemetry-csv)
-        run: cargo publish --dry-run --locked -p vahtisiru-telemetry-csv
+      # No publish --dry-run for the sub-crate: cargo publish is a
+      # maintainer action, and a dry-run here trips zizmor's
+      # trusted-publishing check without qualifying anything extra.
