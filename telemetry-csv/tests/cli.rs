@@ -203,6 +203,21 @@ fn json_success_reports_counts() {
 }
 
 #[test]
+fn json_stdin_success_reports_counts() {
+    let (code, stdout, _) = run(
+        &["--json", "-"],
+        Some(&format!("{HEADER}\n1000,60.5,250.0,70.0,120.0\nbad,row\n")),
+    );
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains("\"status\":\"ok\"")
+            && stdout.contains("\"rows\":1")
+            && stdout.contains("\"skipped\":1")
+            && stdout.contains("\"input\":\"<stdin>\"")
+    );
+}
+
+#[test]
 fn json_error_is_still_single_line() {
     let (code, stdout, _) = run(
         &["--json", "-"],

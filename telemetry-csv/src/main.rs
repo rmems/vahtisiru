@@ -80,13 +80,13 @@ fn json_escape(value: &str) -> String {
 fn report_json(input: &str, result: &Result<LoadResult, ContractFailure>) {
     let (status, rows, skipped, error) = match result {
         Ok(load) => ("ok", load.rows.len(), load.skipped, String::new()),
-        Err(ContractFailure::NoUsableRows { skipped }) => (
-            "error",
-            0,
-            *skipped,
-            ContractFailure::NoUsableRows { skipped: *skipped }.to_string(),
-        ),
-        Err(failure) => ("error", 0, 0, failure.to_string()),
+        Err(failure) => {
+            let skipped = match failure {
+                ContractFailure::NoUsableRows { skipped } => *skipped,
+                ContractFailure::Parse(_) => 0,
+            };
+            ("error", 0, skipped, failure.to_string())
+        }
     };
     println!(
         "{{\"input\":\"{}\",\"status\":\"{status}\",\"rows\":{rows},\"skipped\":{skipped},\"error\":\"{}\"}}",
