@@ -77,6 +77,12 @@ fn json_escape(value: &str) -> String {
 fn report_json(input: &str, result: &Result<LoadResult, ContractFailure>) {
     let (status, rows, skipped, error) = match result {
         Ok(load) => ("ok", load.rows.len(), load.skipped, String::new()),
+        Err(ContractFailure::NoUsableRows { skipped }) => (
+            "error",
+            0,
+            *skipped,
+            ContractFailure::NoUsableRows { skipped: *skipped }.to_string(),
+        ),
         Err(failure) => ("error", 0, 0, failure.to_string()),
     };
     println!(
@@ -90,18 +96,29 @@ fn report_json(input: &str, result: &Result<LoadResult, ContractFailure>) {
 enum ContractFailure {
     /// Header/I/O failure from the contract parser itself.
     Parse(TelemetryCsvError),
-    /// Parsed cleanly but produced no usable rows.
-    NoUsableRows,
+    /// Parsed cleanly but produced no usable rows; `skipped` preserves the
+    /// malformed-row count for reporting.
+    NoUsableRows { skipped: usize },
 }
 
 impl std::fmt::Display for ContractFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Parse(err) => write!(f, "{err}"),
-            Self::NoUsableRows => write!(
-                f,
-                "no usable rows: contract requires at least one valid data row"
-            ),
+            Self::NoUsableRows { skipped } => {
+                if *skipped == 0 {
+                    write!(
+                        f,
+                        "no usable rows: contract requires at least one valid data row"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "no usable rows: contract requires at least one valid data row \
+                         ({skipped} malformed row(s) skipped)"
+                    )
+                }
+            }
         }
     }
 }
@@ -109,7 +126,9 @@ impl std::fmt::Display for ContractFailure {
 fn validate(contents: &str) -> Result<LoadResult, ContractFailure> {
     let load = parse_csv(contents).map_err(ContractFailure::Parse)?;
     if !load.has_usable_rows() {
-        return Err(ContractFailure::NoUsableRows);
+        return Err(ContractFailure::NoUsableRows {
+            skipped: load.skipped,
+        });
     }
     Ok(load)
 }
@@ -132,7 +151,15 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Err(err) => {
-            eprintln!("vahtisiru-telemetry-csv: {err}\n{USAGE}");
+            // --json consumers get a JSON result even for usage errors.
+            if argv.iter().any(|a| a == "--json") {
+                println!(
+                    "{{\"input\":\"<args>\",\"status\":\"error\",\"rows\":0,\"skipped\":0,\"error\":\"{}\"}}",
+                    json_escape(&err)
+                );
+            } else {
+                eprintln!("vahtisiru-telemetry-csv: {err}\n{USAGE}");
+            }
             return ExitCode::from(EXIT_IO_OR_USAGE);
         }
     };

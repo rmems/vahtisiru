@@ -64,8 +64,15 @@ fn relay_error_tag(err: &relay_copy::TelemetryCsvError) -> &'static str {
     }
 }
 
-fn summarize(load: &contract::LoadResult) -> (usize, usize) {
-    (load.rows.len(), load.skipped)
+fn rows_match(a: &[contract::TelemetryCsvRow], b: &[relay_copy::TelemetryCsvRow]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b.iter()).all(|(a, b)| {
+            a.timestamp_ms == b.timestamp_ms
+                && a.gpu_temp_c == b.gpu_temp_c
+                && a.gpu_power_w == b.gpu_power_w
+                && a.cpu_tctl_c == b.cpu_tctl_c
+                && a.cpu_package_power_w == b.cpu_package_power_w
+        })
 }
 
 #[test]
@@ -81,11 +88,10 @@ fn parse_csv_outcomes_match_relay_copy() {
         let ours = contract::parse_csv(case);
         let theirs = relay_copy::parse_csv(case);
         match (ours, theirs) {
-            (Ok(a), Ok(b)) => assert_eq!(
-                summarize(&a),
-                (b.rows.len(), b.skipped),
-                "case {i} diverged"
-            ),
+            (Ok(a), Ok(b)) => {
+                assert_eq!(a.skipped, b.skipped, "case {i} skipped diverged");
+                assert!(rows_match(&a.rows, &b.rows), "case {i} rows diverged");
+            }
             (Err(a), Err(b)) => assert_eq!(
                 error_tag(&a),
                 relay_error_tag(&b),

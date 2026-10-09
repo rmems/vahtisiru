@@ -211,6 +211,27 @@ fn json_error_is_still_single_line() {
 }
 
 #[test]
+fn json_all_malformed_reports_skipped_count() {
+    let path = write_csv(
+        "json_all_bad",
+        &format!("{HEADER}\nbad,row\nalso,bad,fields,here,extra,cols\n"),
+    );
+    let (code, stdout, _) = run(&["--json", path.to_str().unwrap()], None);
+    assert_eq!(code, 1);
+    assert!(stdout.contains("\"skipped\":2"));
+    assert!(stdout.contains("no usable rows"));
+}
+
+#[test]
+fn json_usage_error_still_emits_result() {
+    let (code, stdout, _) = run(&["--json"], None);
+    assert_eq!(code, 2);
+    assert_eq!(stdout.trim().lines().count(), 1);
+    assert!(stdout.contains("\"status\":\"error\""));
+    assert!(stdout.contains("missing PATH argument"));
+}
+
+#[test]
 fn no_arguments_exits_two_with_usage() {
     let (code, _, stderr) = run(&[], None);
     assert_eq!(code, 2);
