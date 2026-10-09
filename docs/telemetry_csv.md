@@ -78,7 +78,7 @@ samples.csv: ok — 2 valid row(s), 0 malformed row(s) skipped
 $ cat samples.csv | vahtisiru-telemetry-csv -        # stdin
 
 $ vahtisiru-telemetry-csv --json broken.csv          # machine-readable
-{"input":"broken.csv","status":"error","rows":0,"skipped":0,"error":"telemetry CSV 'broken.csv' header mismatch: expected '...', got '...'"}
+{"input":"broken.csv","status":"error","rows":0,"skipped":0,"error":"telemetry CSV 'broken.csv' header mismatch: expected 'timestamp_ms,gpu_temp_c,gpu_power_w,cpu_tctl_c,cpu_package_power_w', got 'wrong,header'"}
 ```
 
 Exit status is stable for CI use:

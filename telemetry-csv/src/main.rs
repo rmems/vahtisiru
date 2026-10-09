@@ -67,6 +67,9 @@ fn json_escape(value: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            // Line/paragraph separators break naive JSON consumers.
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
             ch if (ch as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", ch as u32)),
             ch => out.push(ch),
         }
@@ -164,6 +167,10 @@ fn main() -> ExitCode {
         }
     };
 
+    run_validator(&args)
+}
+
+fn run_validator(args: &Args) -> ExitCode {
     let input_label = if args.path == "-" {
         "<stdin>".to_string()
     } else {
@@ -177,7 +184,7 @@ fn main() -> ExitCode {
                 report_json(
                     &input_label,
                     &Err(ContractFailure::Parse(TelemetryCsvError::Io {
-                        path: std::path::PathBuf::from(&args.path),
+                        path: std::path::PathBuf::from(&input_label),
                         source: err,
                     })),
                 );

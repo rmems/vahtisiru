@@ -74,9 +74,11 @@ fn canonical_file_exits_zero_and_reports_counts() {
     );
     let (code, stdout, _) = run(&[path.to_str().unwrap()], None);
     assert_eq!(code, 0);
-    assert!(stdout.contains("2 valid row(s)"));
-    assert!(stdout.contains("0 malformed row(s)"));
-    assert!(stdout.contains(path.to_str().unwrap()));
+    assert!(
+        stdout.contains("2 valid row(s)")
+            && stdout.contains("0 malformed row(s)")
+            && stdout.contains(path.to_str().unwrap())
+    );
 }
 
 #[test]
@@ -192,10 +194,12 @@ fn json_success_reports_counts() {
     );
     let (code, stdout, _) = run(&["--json", path.to_str().unwrap()], None);
     assert_eq!(code, 0);
-    assert!(stdout.contains("\"status\":\"ok\""));
-    assert!(stdout.contains("\"rows\":1"));
-    assert!(stdout.contains("\"skipped\":1"));
-    assert!(stdout.contains("\"error\":\"\""));
+    assert!(
+        stdout.contains("\"status\":\"ok\"")
+            && stdout.contains("\"rows\":1")
+            && stdout.contains("\"skipped\":1")
+            && stdout.contains("\"error\":\"\"")
+    );
 }
 
 #[test]
@@ -206,8 +210,7 @@ fn json_error_is_still_single_line() {
     );
     assert_eq!(code, 1);
     assert_eq!(stdout.trim().lines().count(), 1);
-    assert!(stdout.contains("\"status\":\"error\""));
-    assert!(stdout.contains("header mismatch"));
+    assert!(stdout.contains("\"status\":\"error\"") && stdout.contains("header mismatch"));
 }
 
 #[test]
@@ -227,8 +230,7 @@ fn json_usage_error_still_emits_result() {
     let (code, stdout, _) = run(&["--json"], None);
     assert_eq!(code, 2);
     assert_eq!(stdout.trim().lines().count(), 1);
-    assert!(stdout.contains("\"status\":\"error\""));
-    assert!(stdout.contains("missing PATH argument"));
+    assert!(stdout.contains("\"status\":\"error\"") && stdout.contains("missing PATH argument"));
 }
 
 #[test]
