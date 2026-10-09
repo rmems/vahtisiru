@@ -1,0 +1,6 @@
+timestamp_ms,gpu_temp_c,gpu_power_w,cpu_tctl_c,cpu_package_power_w
+   
+1000,60.5,250.0,70.0,120.0
+	
+2000,61.0,252.5,70.5,121.5
+   
