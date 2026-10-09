@@ -64,15 +64,24 @@ fn relay_error_tag(err: &relay_copy::TelemetryCsvError) -> &'static str {
     }
 }
 
+fn row_eq(a: &contract::TelemetryCsvRow, b: &relay_copy::TelemetryCsvRow) -> bool {
+    (
+        a.timestamp_ms,
+        a.gpu_temp_c,
+        a.gpu_power_w,
+        a.cpu_tctl_c,
+        a.cpu_package_power_w,
+    ) == (
+        b.timestamp_ms,
+        b.gpu_temp_c,
+        b.gpu_power_w,
+        b.cpu_tctl_c,
+        b.cpu_package_power_w,
+    )
+}
+
 fn rows_match(a: &[contract::TelemetryCsvRow], b: &[relay_copy::TelemetryCsvRow]) -> bool {
-    a.len() == b.len()
-        && a.iter().zip(b.iter()).all(|(a, b)| {
-            a.timestamp_ms == b.timestamp_ms
-                && a.gpu_temp_c == b.gpu_temp_c
-                && a.gpu_power_w == b.gpu_power_w
-                && a.cpu_tctl_c == b.cpu_tctl_c
-                && a.cpu_package_power_w == b.cpu_package_power_w
-        })
+    a.len() == b.len() && a.iter().zip(b.iter()).all(|(a, b)| row_eq(a, b))
 }
 
 #[test]
