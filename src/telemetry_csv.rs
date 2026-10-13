@@ -18,6 +18,12 @@
 //! CSV columns this relay does not currently acquire.
 //!
 //! Contract: [`docs/telemetry_csv.md`](../docs/telemetry_csv.md).
+//!
+//! The standalone contract-only package `vahtisiru-telemetry-csv` (workspace
+//! member `telemetry-csv/`, plus the `vahtisiru-telemetry-csv` validator CLI)
+//! ships the same semantics without the relay dependencies for producers and
+//! CI ([RM-1905](https://linear.app/rpd-34/issue/RM-1905)). The copies are
+//! kept in lockstep by `telemetry-csv/tests/parity.rs`.
 
 use std::fmt;
 use std::io;

@@ -3,6 +3,7 @@ name = "vahtisiru"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.98.1"
+default-run = "vahtisiru"
 authors = ["Raul Cardenas Montoya"]
 description = "Typed hardware telemetry and deterministic safety library, plus the vahtisiru supervisor binary (software-only, no built-in FPGA bridge)."
 license = "MIT OR Apache-2.0"
@@ -60,3 +61,5 @@ name = "vahtisiru"
 path = "src/main.rs"
 
 [workspace]
+members = [".", "telemetry-csv"]
+default-members = [".", "telemetry-csv"]
