@@ -61,6 +61,7 @@ fn parse_args(argv: &[String]) -> Result<Option<Args>, UsageError> {
     let mut path: Option<String> = None;
     for arg in argv {
         match arg.as_str() {
+            // Already recognized in the pre-scan; needed so it isn't read as PATH.
             "--json" => {}
             "-h" | "--help" => return Ok(None),
             _ if path.is_none() => path = Some(arg.clone()),
