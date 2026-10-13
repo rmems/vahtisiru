@@ -55,11 +55,13 @@ impl std::fmt::Display for UsageError {
 }
 
 fn parse_args(argv: &[String]) -> Result<Option<Args>, UsageError> {
-    let mut json = false;
+    // Flags are recognized position-independently, including after a bad
+    // argument, so usage errors still honor --json.
+    let json = argv.iter().any(|arg| arg == "--json");
     let mut path: Option<String> = None;
     for arg in argv {
         match arg.as_str() {
-            "--json" => json = true,
+            "--json" => {}
             "-h" | "--help" => return Ok(None),
             _ if path.is_none() => path = Some(arg.clone()),
             _ => {

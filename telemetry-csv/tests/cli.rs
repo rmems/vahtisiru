@@ -249,6 +249,14 @@ fn json_usage_error_still_emits_result() {
 }
 
 #[test]
+fn json_flag_after_bad_argument_still_emits_result() {
+    let (code, stdout, _) = run(&["a.csv", "extra.csv", "--json"], None);
+    assert_eq!(code, 2);
+    assert_eq!(stdout.trim().lines().count(), 1);
+    assert!(stdout.contains("\"status\":\"error\"") && stdout.contains("unexpected argument"));
+}
+
+#[test]
 fn no_arguments_exits_two_with_usage() {
     let (code, _, stderr) = run(&[], None);
     assert_eq!(code, 2);
