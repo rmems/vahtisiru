@@ -72,6 +72,12 @@ require querying neural state.
 `--force-software-only` is the only simulated path; simulated numbers never
 drive thresholds.
 
+Classification re-validates every safety sample that claims `Valid`. The value
+must be finite, inside the channel's own contract range (0–125 °C, 0–2000 W),
+and labelled as that channel. Otherwise it is `telemetry_invalid`, even when the
+frame was built by hand or deserialized rather than produced by
+`TelemetrySample::from_raw`.
+
 When missing, invalid, and stale appear on different safety channels, the
 worst fault wins: **missing > invalid > stale**. Equal rank prefers
 `gpu_temp_c` (stable, matches the previous temp-then-power order).

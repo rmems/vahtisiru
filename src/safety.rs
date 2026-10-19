@@ -480,6 +480,7 @@ impl SafetyMachine {
             }
             ActuatorOutcome::ApplyFailed(err) => {
                 self.reason_code = SafetyReason::ApplyFailed;
+                self.last_reason = format!("brake apply failed: {err}");
                 self.brake_engaged = false;
                 self.last_actuator_error = Some(err);
                 self.actuator_failures_total = self.actuator_failures_total.saturating_add(1);
@@ -498,6 +499,7 @@ impl SafetyMachine {
             }
             ActuatorOutcome::ReleaseFailed(err) => {
                 self.reason_code = SafetyReason::ReleaseFailed;
+                self.last_reason = format!("brake release failed: {err}");
                 self.last_actuator_error = Some(err);
                 self.actuator_failures_total = self.actuator_failures_total.saturating_add(1);
                 actuator_failed = true;
@@ -778,6 +780,20 @@ impl SafetyChannel {
             Self::Power => "power_w",
         }
     }
+
+    const fn signal(self) -> crate::telemetry::SignalId {
+        match self {
+            Self::GpuTemp => crate::telemetry::SignalId::GpuTempC,
+            Self::Power => crate::telemetry::SignalId::PowerW,
+        }
+    }
+
+    /// Finite, inside this channel's contract range, and labelled as this
+    /// channel (a relabelled sample cannot borrow another signal's range).
+    fn accepts(self, sample: &TelemetrySample<f32>, v: f32) -> bool {
+        let spec = crate::telemetry::signal_spec(self.signal());
+        sample.signal == self.signal() && v.is_finite() && (spec.min..=spec.max).contains(&v)
+    }
 }
 
 /// Typed sample fault: which channel, and whether it is missing/invalid/stale.
@@ -836,8 +852,17 @@ impl SampleFault {
 }
 
 /// Typed fault for one safety sample, or `None` when it is valid with a value.
-fn sample_fault(sample: &TelemetrySample<f32>) -> Option<SampleFault> {
+///
+/// `Valid` is re-checked here, independent of how the sample was built:
+/// fields are public and the type is deserializable, so a sample can claim
+/// `Valid` with NaN, ±inf, or an out-of-range value. Such a sample would
+/// otherwise slip through the threshold comparisons (NaN compares false)
+/// and fail open. It is classified `Invalid` instead.
+fn sample_fault(channel: SafetyChannel, sample: &TelemetrySample<f32>) -> Option<SampleFault> {
     match sample.validity {
+        SampleValidity::Valid if sample.value.is_some_and(|v| !channel.accepts(sample, v)) => {
+            Some(SampleFault::Invalid)
+        }
         SampleValidity::Valid if sample.value.is_some() => None,
         SampleValidity::Valid | SampleValidity::Missing => Some(SampleFault::Missing),
         SampleValidity::Invalid => Some(SampleFault::Invalid),
@@ -849,7 +874,7 @@ fn safety_value(
     channel: SafetyChannel,
     sample: &TelemetrySample<f32>,
 ) -> Result<f32, FrameAssessment> {
-    match (sample_fault(sample), sample.value) {
+    match (sample_fault(channel, sample), sample.value) {
         (None, Some(v)) => Ok(v),
         (Some(fault), _) => Err(fault.assessment(channel)),
         (None, None) => Err(SampleFault::Missing.assessment(channel)),
@@ -867,7 +892,7 @@ fn sample_fault_rank(
     sample: &TelemetrySample<f32>,
     channel: SafetyChannel,
 ) -> Option<(u8, FrameAssessment)> {
-    sample_fault(sample).map(|fault| (fault.rank(), fault.assessment(channel)))
+    sample_fault(channel, sample).map(|fault| (fault.rank(), fault.assessment(channel)))
 }
 
 fn worst_safety_fault(frame: &TelemetryFrame) -> Option<FrameAssessment> {

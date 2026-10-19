@@ -559,6 +559,80 @@ fn before_any_telemetry_the_machine_is_fail_closed() {
     assert!(snap.desired_brake);
 }
 
+// ── Forged / deserialized samples (CodeAnt review, PR #85) ──────────
+
+/// Overwrite one safety channel with a value that claims `Valid`,
+/// bypassing `TelemetrySample::from_raw` validation.
+fn forged(power_channel: bool, value: f32) -> TelemetryFrame {
+    let mut f = frame(60.0, 200.0);
+    let sample = if power_channel {
+        &mut f.power_w
+    } else {
+        &mut f.gpu_temp_c
+    };
+    sample.value = Some(value);
+    sample.validity = vahtisiru::telemetry::SampleValidity::Valid;
+    f
+}
+
+const FORGED_CASES: [(bool, f32, SafetyReason); 8] = [
+    (false, f32::NAN, SafetyReason::TempInvalid),
+    (false, f32::INFINITY, SafetyReason::TempInvalid),
+    (false, f32::NEG_INFINITY, SafetyReason::TempInvalid),
+    (false, 125.1, SafetyReason::TempInvalid),
+    (false, -0.1, SafetyReason::TempInvalid),
+    (true, f32::NAN, SafetyReason::PowerInvalid),
+    (true, f32::NEG_INFINITY, SafetyReason::PowerInvalid),
+    (true, 2_000.1, SafetyReason::PowerInvalid),
+];
+
+#[test]
+fn forged_valid_non_finite_or_out_of_range_samples_fail_closed() {
+    for (power, value, code) in FORGED_CASES {
+        let snap = machine().evaluate(&forged(power, value));
+        assert_fail_closed_apply(&snap, SafetyState::TelemetryInvalid, code);
+    }
+}
+
+#[test]
+fn deserialized_valid_out_of_range_samples_fail_closed() {
+    // JSON cannot carry NaN/inf (serde_json writes them as null); finite
+    // out-of-range values and overflowing literals can still arrive as Valid.
+    let mut evaluated = 0;
+    for (power, value, code) in [
+        (false, "125.1", SafetyReason::TempInvalid),
+        (false, "-0.1", SafetyReason::TempInvalid),
+        (false, "1e39", SafetyReason::TempInvalid),
+        (true, "2000.1", SafetyReason::PowerInvalid),
+    ] {
+        let mut json = serde_json::to_value(frame(60.0, 200.0)).unwrap();
+        let key = if power { "power_w" } else { "gpu_temp_c" };
+        json[key]["value"] = serde_json::from_str(value).unwrap();
+        json[key]["validity"] =
+            serde_json::to_value(vahtisiru::telemetry::SampleValidity::Valid).unwrap();
+        let Ok(f) = serde_json::from_value::<TelemetryFrame>(json) else {
+            continue; // rejected at the boundary: also fail-closed
+        };
+        evaluated += 1;
+        let snap = machine().evaluate(&f);
+        assert_fail_closed_apply(&snap, SafetyState::TelemetryInvalid, code);
+    }
+    assert!(evaluated >= 3, "finite out-of-range JSON must deserialize");
+}
+
+#[test]
+fn forged_signal_id_cannot_borrow_a_wider_range() {
+    // A temperature sample relabelled as power would pass the 0..2000 W range.
+    let mut f = forged(false, 500.0);
+    f.gpu_temp_c.signal = vahtisiru::telemetry::SignalId::PowerW;
+    let snap = machine().evaluate(&f);
+    assert_fail_closed_apply(
+        &snap,
+        SafetyState::TelemetryInvalid,
+        SafetyReason::TempInvalid,
+    );
+}
+
 // ── Hysteresis ──────────────────────────────────────────────────────
 
 fn braked_machine() -> SafetyMachine {
@@ -763,8 +837,12 @@ fn actuator_failure_is_observable_and_does_not_suppress_the_trip() {
         SafetyReason::ApplyFailed,
     );
     assert_eq!(
-        (failed.actuator_failed, m.actuator_failures_total()),
-        (true, 1)
+        (
+            failed.actuator_failed,
+            m.actuator_failures_total(),
+            failed.last_reason.as_str()
+        ),
+        (true, 1, "brake apply failed: sudo denied")
     );
     // Next evaluation still classifies and still wants the brake.
     let next = m.evaluate(&frame(90.0, 200.0));
