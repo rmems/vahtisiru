@@ -1363,18 +1363,16 @@ mod tests {
             }
             snap.trip
         };
-        assert_eq!(
-            step(&mut machine, 90.0, true),
-            Some(SafetyReason::ThermalCritical)
-        );
-        assert_eq!(step(&mut machine, 60.0, false), None); // pending Apply dropped
+        let first = step(&mut machine, 90.0, true); // gate busy: Apply parked
+        let dropped = step(&mut machine, 60.0, false); // pending Apply dropped
         drop(permit);
-        assert_eq!(step(&mut machine, 60.0, false), None);
+        let healthy = step(&mut machine, 60.0, false);
+        let second = step(&mut machine, 90.0, true); // gate free: Apply spawned
+        let critical = Some(SafetyReason::ThermalCritical);
         assert_eq!(
-            step(&mut machine, 90.0, true),
-            Some(SafetyReason::ThermalCritical)
+            (first, dropped, healthy, second, machine.trips_total()),
+            (critical, None, None, critical, 2)
         );
-        assert_eq!(machine.trips_total(), 2);
         assert!(brake_task.is_some(), "the second apply really was spawned");
     }
 
