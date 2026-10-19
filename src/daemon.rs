@@ -15,7 +15,7 @@ use crate::gpu::{GpuTarget, HardwareBridge, NvmlActuator};
 use crate::nvml_gate::{NvmlGate, NvmlRunError};
 use crate::publish::{
     AbsentPublisher, CorpusIpcPublisher, DEFAULT_IPC_ENDPOINT, DEFAULT_IPC_SESSION_ID, QueueConfig,
-    QueueFullPolicy, SensoryPublisher, evaluate_then_try_publish,
+    QueueFullPolicy, SensoryPublisher, evaluate_then_try_publish, try_publish_isolated,
 };
 use crate::safety::{
     ActuatorError, ActuatorOutcome, BRAKE_FRACTION, BrakeIntent, PowerLimitObservation,
@@ -396,7 +396,7 @@ pub async fn run(prepared: &mut SupervisorStart) -> Result<(), Box<dyn std::erro
             );
         } else if !evaluated_this_iter {
             // Publication is outside the safety critical path and never awaited.
-            let _ = publisher.try_publish(&telemetry.to_sensory_mapping());
+            let _ = try_publish_isolated(publisher.as_ref(), &telemetry.to_sensory_mapping());
         }
 
         dispatch_due_or_pending(
@@ -856,6 +856,14 @@ fn store_safety(
 }
 
 fn log_safety_snapshot(snap: &SafetySnapshot, warned_brake_held_sim: &mut bool) {
+    if let Some(code) = snap.trip {
+        eprintln!(
+            "[relay] SAFETY TRIP reason={} state={} ({})",
+            code.as_str(),
+            snap.state.as_str(),
+            snap.last_reason
+        );
+    }
     if let Some((from, to)) = snap.transition {
         eprintln!(
             "[relay] safety {} → {} ({})",

@@ -955,14 +955,43 @@ pub const fn validity_name(validity: SampleValidity) -> &'static str {
 }
 
 /// Evaluate safety first, then attempt publish. Publish cannot change the snapshot.
+///
+/// The publish attempt goes through [`try_publish_isolated`], so a panicking
+/// publisher cannot unwind through the caller and discard the already
+/// computed safety snapshot (GH#42).
 pub fn evaluate_then_try_publish<P: SensoryPublisher + ?Sized>(
     machine: &mut SafetyMachine,
     frame: &TelemetryFrame,
     publisher: &P,
 ) -> (SafetySnapshot, Result<(), PublishError>) {
     let snapshot = machine.evaluate(frame);
-    let publish_result = publisher.try_publish(&frame.to_sensory_mapping());
+    let publish_result = try_publish_isolated(publisher, &frame.to_sensory_mapping());
     (snapshot, publish_result)
+}
+
+/// Stable [`PublishError::SendFailed`] message for a publisher that panicked.
+pub const PUBLISHER_PANICKED: &str = "sensory publisher panicked";
+
+/// Call [`SensoryPublisher::try_publish`] inside a panic boundary.
+///
+/// A panic in a publisher (or anything it calls) is contained, counted as a
+/// `send_failed` drop, and reported as
+/// `PublishError::SendFailed(PUBLISHER_PANICKED)`. This keeps the safety loop
+/// alive when the best-effort sensory path misbehaves. It does not make a
+/// publisher that *blocks* safe: publishers must still return promptly.
+pub fn try_publish_isolated<P: SensoryPublisher + ?Sized>(
+    publisher: &P,
+    mapping: &SensoryMapping,
+) -> Result<(), PublishError> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        publisher.try_publish(mapping)
+    })) {
+        Ok(result) => result,
+        Err(_) => {
+            record_drop(DropReason::SendFailed);
+            Err(PublishError::SendFailed(PUBLISHER_PANICKED.to_string()))
+        }
+    }
 }
 
 #[cfg(test)]

@@ -116,6 +116,105 @@ impl SafetyState {
     }
 }
 
+/// Closed, machine-readable reason for a safety classification or event.
+///
+/// Every [`FrameAssessment`] and [`SafetySnapshot`] carries one. Unlike the
+/// human-readable `reason` strings, this vocabulary is stable and bounded, so
+/// it is safe as a Prometheus label (`safety_trips_total{reason=...}`) and as
+/// a test oracle. Do not derive codes from free-text messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SafetyReason {
+    /// Valid real telemetry below every warn threshold.
+    Healthy,
+    /// `TelemetrySource::SoftwareFallback`: thresholds are not evaluated.
+    Simulated,
+    /// GPU temperature exceeds the critical limit.
+    ThermalCritical,
+    /// Board power exceeds the critical limit.
+    PowerCritical,
+    /// GPU temperature is in the warn band.
+    ThermalWarn,
+    /// Board power is in the warn band.
+    PowerWarn,
+    /// `gpu_temp_c` sample missing (dropout, NVML unavailable, or Valid+`None`).
+    TempMissing,
+    /// `power_w` sample missing.
+    PowerMissing,
+    /// `gpu_temp_c` non-finite, out of range, or future-dated.
+    TempInvalid,
+    /// `power_w` non-finite, out of range, or future-dated.
+    PowerInvalid,
+    /// `gpu_temp_c` older than the telemetry contract stale threshold.
+    TempStale,
+    /// `power_w` older than the telemetry contract stale threshold.
+    PowerStale,
+    /// Sample age or acquisition interval exceeds the configured policy.
+    PolicyStale,
+    /// No device default and no explicit power limits: cannot authorize real health.
+    PowerPolicyUnavailable,
+    /// Machine constructed; no frame evaluated yet (fail closed).
+    NoTelemetryYet,
+    /// Relay-owned brake adopted at startup.
+    LeftoverBrake,
+    /// Actuator reported a successful release.
+    BrakeReleased,
+    /// Actuator apply attempt failed.
+    ApplyFailed,
+    /// Actuator release attempt failed.
+    ReleaseFailed,
+}
+
+impl SafetyReason {
+    /// Every reason code, in stable order. Prometheus cardinality is this length.
+    pub const ALL: [Self; 19] = [
+        Self::Healthy,
+        Self::Simulated,
+        Self::ThermalCritical,
+        Self::PowerCritical,
+        Self::ThermalWarn,
+        Self::PowerWarn,
+        Self::TempMissing,
+        Self::PowerMissing,
+        Self::TempInvalid,
+        Self::PowerInvalid,
+        Self::TempStale,
+        Self::PowerStale,
+        Self::PolicyStale,
+        Self::PowerPolicyUnavailable,
+        Self::NoTelemetryYet,
+        Self::LeftoverBrake,
+        Self::BrakeReleased,
+        Self::ApplyFailed,
+        Self::ReleaseFailed,
+    ];
+
+    /// Stable snake_case label for logs and Prometheus.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Simulated => "simulated",
+            Self::ThermalCritical => "thermal_critical",
+            Self::PowerCritical => "power_critical",
+            Self::ThermalWarn => "thermal_warn",
+            Self::PowerWarn => "power_warn",
+            Self::TempMissing => "temp_missing",
+            Self::PowerMissing => "power_missing",
+            Self::TempInvalid => "temp_invalid",
+            Self::PowerInvalid => "power_invalid",
+            Self::TempStale => "temp_stale",
+            Self::PowerStale => "power_stale",
+            Self::PolicyStale => "policy_stale",
+            Self::PowerPolicyUnavailable => "power_policy_unavailable",
+            Self::NoTelemetryYet => "no_telemetry_yet",
+            Self::LeftoverBrake => "leftover_brake",
+            Self::BrakeReleased => "brake_released",
+            Self::ApplyFailed => "apply_failed",
+            Self::ReleaseFailed => "release_failed",
+        }
+    }
+}
+
 /// Brake command the supervisor may dispatch to a [`SafetyActuator`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrakeIntent {
@@ -165,7 +264,9 @@ pub enum AssessmentKind {
 pub struct FrameAssessment {
     /// Stateless kind (no hysteresis).
     pub kind: AssessmentKind,
-    /// Human-readable reason suitable for logs and metrics.
+    /// Closed machine-readable reason code.
+    pub code: SafetyReason,
+    /// Human-readable reason suitable for logs (never a metric label).
     pub reason: String,
 }
 
@@ -186,6 +287,11 @@ pub struct SafetySnapshot {
     pub hysteresis_ok_count: u32,
     /// Reason from the latest classification or actuator feedback.
     pub last_reason: String,
+    /// Closed reason code matching [`Self::last_reason`].
+    pub reason_code: SafetyReason,
+    /// Deterministic trip event: `Some(code)` on the step where policy newly
+    /// wants the brake (rising edge of `desired_brake`), else `None`.
+    pub trip: Option<SafetyReason>,
     /// Last apply/release error, if the overlay is active.
     pub last_actuator_error: Option<String>,
     /// Named-state change this step, if any.
@@ -229,8 +335,11 @@ pub struct SafetyMachine {
     last_policy_state: SafetyState,
     state: SafetyState,
     last_reason: String,
+    reason_code: SafetyReason,
+    trip_latched: bool,
     transitions_total: u64,
     actuator_failures_total: u64,
+    trips_total: u64,
 }
 
 impl Default for SafetyMachine {
@@ -264,8 +373,11 @@ impl SafetyMachine {
             last_policy_state: SafetyState::TelemetryMissing,
             state: SafetyState::TelemetryMissing,
             last_reason: "no telemetry evaluated yet".to_string(),
+            reason_code: SafetyReason::NoTelemetryYet,
+            trip_latched: false,
             transitions_total: 0,
             actuator_failures_total: 0,
+            trips_total: 0,
         }
     }
 
@@ -281,6 +393,12 @@ impl SafetyMachine {
         self.actuator_failures_total
     }
 
+    /// Deterministic trip events (rising edges of `desired_brake`) observed.
+    #[must_use]
+    pub fn trips_total(&self) -> u64 {
+        self.trips_total
+    }
+
     /// Seed leftover hardware throttle detected at process start.
     pub fn seed_brake_applied(&mut self) {
         self.brake_engaged = true;
@@ -289,6 +407,9 @@ impl SafetyMachine {
         self.last_policy_state = SafetyState::Recovering;
         self.state = SafetyState::Recovering;
         self.last_reason = "leftover emergency brake detected at startup".to_string();
+        self.reason_code = SafetyReason::LeftoverBrake;
+        // Adoption is not a new trip; release still requires the Ok streak.
+        self.trip_latched = true;
     }
 
     /// Current snapshot without advancing hysteresis.
@@ -311,6 +432,7 @@ impl SafetyMachine {
         }
         self.last_policy_state = policy_state;
         self.last_reason = assessment.reason;
+        self.reason_code = assessment.code;
         self.compose_and_store(desired_brake, false)
     }
 
@@ -325,6 +447,7 @@ impl SafetyMachine {
                 self.just_released = false;
             }
             ActuatorOutcome::ApplyFailed(err) => {
+                self.reason_code = SafetyReason::ApplyFailed;
                 self.brake_engaged = false;
                 self.last_actuator_error = Some(err);
                 self.actuator_failures_total = self.actuator_failures_total.saturating_add(1);
@@ -339,8 +462,10 @@ impl SafetyMachine {
                 // telemetry. Warn/Critical on that frame re-applies.
                 self.last_policy_state = SafetyState::HealthyReal;
                 self.last_reason = "brake released".to_string();
+                self.reason_code = SafetyReason::BrakeReleased;
             }
             ActuatorOutcome::ReleaseFailed(err) => {
+                self.reason_code = SafetyReason::ReleaseFailed;
                 self.last_actuator_error = Some(err);
                 self.actuator_failures_total = self.actuator_failures_total.saturating_add(1);
                 actuator_failed = true;
@@ -413,6 +538,13 @@ impl SafetyMachine {
             None
         };
         self.state = reported;
+        let trip = if desired_brake && !self.trip_latched {
+            self.trips_total = self.trips_total.saturating_add(1);
+            Some(self.reason_code)
+        } else {
+            None
+        };
+        self.trip_latched = desired_brake;
         SafetySnapshot {
             state: reported,
             policy_state: self.last_policy_state,
@@ -421,6 +553,8 @@ impl SafetyMachine {
             intent: SafetySnapshot::intent_from(desired_brake, self.brake_engaged),
             hysteresis_ok_count: self.ok_count,
             last_reason: self.last_reason.clone(),
+            reason_code: self.reason_code,
+            trip,
             last_actuator_error: self.last_actuator_error.clone(),
             transition,
             actuator_failed,
@@ -441,6 +575,8 @@ impl SafetyMachine {
             intent: SafetySnapshot::intent_from(desired, self.brake_engaged),
             hysteresis_ok_count: self.ok_count,
             last_reason: self.last_reason.clone(),
+            reason_code: self.reason_code,
+            trip: None,
             last_actuator_error: self.last_actuator_error.clone(),
             transition,
             actuator_failed,
@@ -494,6 +630,7 @@ pub fn classify_frame_with_policy(
     if frame.source == TelemetrySource::SoftwareFallback {
         return FrameAssessment {
             kind: AssessmentKind::Simulated,
+            code: SafetyReason::Simulated,
             reason: "telemetry source is SoftwareFallback".to_string(),
         };
     }
@@ -505,9 +642,17 @@ pub fn classify_frame_with_policy(
     let (gpu_temp_c, power_w) = match safety_readings(frame) {
         Ok(v) => v,
         Err(status) => {
+            let kind = kind_from_critical_status(&status);
+            let reason = status_reason(status);
+            let name = if reason.contains("power_w") {
+                "power_w"
+            } else {
+                "gpu_temp_c"
+            };
             return FrameAssessment {
-                kind: kind_from_critical_status(&status),
-                reason: status_reason(status),
+                kind,
+                code: fault_code(name, kind),
+                reason,
             };
         }
     };
@@ -519,12 +664,14 @@ pub fn classify_frame_with_policy(
     {
         return FrameAssessment {
             kind: AssessmentKind::Stale,
+            code: SafetyReason::PolicyStale,
             reason: "sample age or acquisition interval exceeds safety policy".into(),
         };
     }
     let Some((power_warn_w, power_critical_w)) = policy.power_limits_w else {
         return FrameAssessment {
             kind: AssessmentKind::Missing,
+            code: SafetyReason::PowerPolicyUnavailable,
             reason: "power policy unavailable: provide device default or explicit limits".into(),
         };
     };
@@ -533,18 +680,21 @@ pub fn classify_frame_with_policy(
     if gpu_temp_c > temp_critical_c {
         return FrameAssessment {
             kind: AssessmentKind::Critical,
+            code: SafetyReason::ThermalCritical,
             reason: format!("GPU thermal: {gpu_temp_c:.0}°C exceeds {temp_critical_c:.0}°C"),
         };
     }
     if power_w > power_critical_w {
         return FrameAssessment {
             kind: AssessmentKind::Critical,
+            code: SafetyReason::PowerCritical,
             reason: format!("GPU power: {power_w:.0}W exceeds {power_critical_w:.0}W safety limit"),
         };
     }
     if gpu_temp_c >= temp_warn_c {
         return FrameAssessment {
             kind: AssessmentKind::Warn,
+            code: SafetyReason::ThermalWarn,
             reason: format!(
                 "GPU thermal: {gpu_temp_c:.0}°C approaching {temp_critical_c:.0}°C limit"
             ),
@@ -553,11 +703,13 @@ pub fn classify_frame_with_policy(
     if power_w >= power_warn_w {
         return FrameAssessment {
             kind: AssessmentKind::Warn,
+            code: SafetyReason::PowerWarn,
             reason: format!("GPU power: {power_w:.0}W approaching safety limit"),
         };
     }
     FrameAssessment {
         kind: AssessmentKind::Ok,
+        code: SafetyReason::Healthy,
         reason: "healthy real telemetry".to_string(),
     }
 }
@@ -591,6 +743,24 @@ fn kind_from_critical_status(status: &SafetyStatus) -> AssessmentKind {
         SafetyStatus::Critical(_) => AssessmentKind::Critical,
         SafetyStatus::Warn(_) => AssessmentKind::Warn,
         SafetyStatus::Ok => AssessmentKind::Ok,
+    }
+}
+
+fn fault_code(name: &str, kind: AssessmentKind) -> SafetyReason {
+    let power = name == "power_w";
+    match (kind, power) {
+        (AssessmentKind::Missing, false) => SafetyReason::TempMissing,
+        (AssessmentKind::Missing, true) => SafetyReason::PowerMissing,
+        (AssessmentKind::Invalid, false) => SafetyReason::TempInvalid,
+        (AssessmentKind::Invalid, true) => SafetyReason::PowerInvalid,
+        (AssessmentKind::Stale, false) => SafetyReason::TempStale,
+        (AssessmentKind::Stale, true) => SafetyReason::PowerStale,
+        (AssessmentKind::Critical, false) => SafetyReason::ThermalCritical,
+        (AssessmentKind::Critical, true) => SafetyReason::PowerCritical,
+        (AssessmentKind::Warn, false) => SafetyReason::ThermalWarn,
+        (AssessmentKind::Warn, true) => SafetyReason::PowerWarn,
+        (AssessmentKind::Ok, _) => SafetyReason::Healthy,
+        (AssessmentKind::Simulated, _) => SafetyReason::Simulated,
     }
 }
 
@@ -642,6 +812,7 @@ fn sample_fault_rank(sample: &TelemetrySample<f32>, name: &str) -> Option<(u8, F
         rank,
         FrameAssessment {
             kind,
+            code: fault_code(name, kind),
             reason: format!("Invalid telemetry: {name} {label}"),
         },
     ))

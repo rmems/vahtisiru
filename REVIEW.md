@@ -6,6 +6,7 @@
 cargo test                    # all tests
 cargo test --lib              # telemetry + telemetry_csv + gpu + cpu + safety + publish
 cargo test --test software_only  # GPU-less integration harness (RM-1217)
+cargo test --test safety_independence  # GH#42 learned-component independence, boundaries, trip events
 cargo test telemetry          # typed contract / fixtures
 cargo test gpu                # gpu acquisition + check_safety facade
 cargo test safety              # SafetyMachine + named states (no GPU)
