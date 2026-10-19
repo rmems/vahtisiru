@@ -229,60 +229,96 @@ enum LexState {
     Char,
 }
 
-/// One step: the state after consuming `c`, and how many extra chars
-/// (beyond `c`) were consumed as part of a two-char token.
-type Step = (LexState, usize);
-
-fn lex_code(c: char, next: Option<char>, after: Option<char>, out: &mut String) -> Step {
-    match (c, next) {
-        ('/', Some('/')) => return (LexState::LineComment, 1),
-        ('/', Some('*')) => return (LexState::BlockComment(1), 1),
-        _ => {}
-    }
-    // A char literal ('x' or '\n'), not a lifetime like 'a or 'static.
-    let is_char = c == '\'' && (next == Some('\\') || after == Some('\''));
-    out.push(c);
-    match c {
-        '"' => (LexState::Str, 0),
-        _ if is_char => (LexState::Char, 0),
-        _ => (LexState::Code, 0),
-    }
-}
-
-fn lex_line_comment(c: char, out: &mut String) -> Step {
-    if c == '\n' {
-        out.push(c);
-        return (LexState::Code, 0);
-    }
-    (LexState::LineComment, 0)
-}
-
-fn lex_block_comment(depth: usize, c: char, next: Option<char>) -> Step {
-    match (c, next) {
-        ('/', Some('*')) => (LexState::BlockComment(depth + 1), 1),
-        ('*', Some('/')) if depth == 1 => (LexState::Code, 1),
-        ('*', Some('/')) => (LexState::BlockComment(depth - 1), 1),
-        _ => (LexState::BlockComment(depth), 0),
-    }
-}
-
-/// Inside a string or char literal: keep everything, honour `\` escapes,
-/// and leave on the matching closing quote.
-fn lex_literal(
-    state: LexState,
-    quote: char,
-    c: char,
-    next: Option<char>,
-    out: &mut String,
-) -> Step {
-    out.push(c);
-    match (c, next) {
-        ('\\', Some(escaped)) => {
-            out.push(escaped);
-            (state, 1)
+impl LexState {
+    /// Closing quote for a literal state.
+    const fn quote(self) -> Option<char> {
+        match self {
+            Self::Str => Some('"'),
+            Self::Char => Some('\''),
+            _ => None,
         }
-        _ if c == quote => (LexState::Code, 0),
-        _ => (state, 0),
+    }
+}
+
+/// Input chars, read position and output buffer for [`strip_comments`].
+/// Every `lex_*` step consumes the current char (plus any second char of a
+/// two-char token) and returns the next state.
+struct Lexer {
+    chars: Vec<char>,
+    pos: usize,
+    out: String,
+}
+
+impl Lexer {
+    fn peek(&self, offset: usize) -> Option<char> {
+        self.chars.get(self.pos + offset).copied()
+    }
+
+    /// Consume `n` chars, appending them to the output when `keep` is set.
+    fn take(&mut self, n: usize, keep: bool) {
+        for _ in 0..n {
+            if let (true, Some(c)) = (keep, self.peek(0)) {
+                self.out.push(c);
+            }
+            self.pos += 1;
+        }
+    }
+
+    fn lex_code(&mut self) -> LexState {
+        let (c, next, after) = (self.peek(0), self.peek(1), self.peek(2));
+        match (c, next) {
+            (Some('/'), Some('/')) => return self.skip(2, LexState::LineComment),
+            (Some('/'), Some('*')) => return self.skip(2, LexState::BlockComment(1)),
+            _ => {}
+        }
+        // A char literal ('x' or '\n'), not a lifetime like 'a or 'static.
+        let is_char = c == Some('\'') && (next == Some('\\') || after == Some('\''));
+        self.take(1, true);
+        match c {
+            Some('"') => LexState::Str,
+            _ if is_char => LexState::Char,
+            _ => LexState::Code,
+        }
+    }
+
+    fn lex_line_comment(&mut self) -> LexState {
+        let newline = self.peek(0) == Some('\n');
+        self.take(1, newline);
+        if newline {
+            LexState::Code
+        } else {
+            LexState::LineComment
+        }
+    }
+
+    fn lex_block_comment(&mut self, depth: usize) -> LexState {
+        match (self.peek(0), self.peek(1)) {
+            (Some('/'), Some('*')) => self.skip(2, LexState::BlockComment(depth + 1)),
+            (Some('*'), Some('/')) if depth == 1 => self.skip(2, LexState::Code),
+            (Some('*'), Some('/')) => self.skip(2, LexState::BlockComment(depth - 1)),
+            _ => self.skip(1, LexState::BlockComment(depth)),
+        }
+    }
+
+    /// Inside a string or char literal: keep everything, honour `\` escapes,
+    /// and leave on the closing quote read from `state`.
+    fn lex_literal(&mut self, state: LexState) -> LexState {
+        let c = self.peek(0);
+        if c == Some('\\') && self.peek(1).is_some() {
+            self.take(2, true);
+            return state;
+        }
+        self.take(1, true);
+        if c == state.quote() {
+            LexState::Code
+        } else {
+            state
+        }
+    }
+
+    fn skip(&mut self, n: usize, next: LexState) -> LexState {
+        self.take(n, false);
+        next
     }
 }
 
@@ -291,26 +327,21 @@ fn lex_literal(
 /// the structural check; not a general Rust tokenizer (raw strings with `"#`
 /// delimiters are treated as ordinary strings).
 fn strip_comments(src: &str) -> String {
-    let chars: Vec<char> = src.chars().collect();
-    let mut out = String::with_capacity(src.len());
-    let (mut state, mut i) = (LexState::Code, 0);
-    while i < chars.len() {
-        let (c, next, after) = (
-            chars[i],
-            chars.get(i + 1).copied(),
-            chars.get(i + 2).copied(),
-        );
-        let (new_state, extra) = match state {
-            LexState::Code => lex_code(c, next, after, &mut out),
-            LexState::LineComment => lex_line_comment(c, &mut out),
-            LexState::BlockComment(depth) => lex_block_comment(depth, c, next),
-            LexState::Str => lex_literal(state, '"', c, next, &mut out),
-            LexState::Char => lex_literal(state, '\'', c, next, &mut out),
+    let mut lexer = Lexer {
+        chars: src.chars().collect(),
+        pos: 0,
+        out: String::with_capacity(src.len()),
+    };
+    let mut state = LexState::Code;
+    while lexer.pos < lexer.chars.len() {
+        state = match state {
+            LexState::Code => lexer.lex_code(),
+            LexState::LineComment => lexer.lex_line_comment(),
+            LexState::BlockComment(depth) => lexer.lex_block_comment(depth),
+            LexState::Str | LexState::Char => lexer.lex_literal(state),
         };
-        state = new_state;
-        i += 1 + extra;
     }
-    out
+    lexer.out
 }
 
 #[test]
