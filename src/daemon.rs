@@ -275,9 +275,9 @@ pub async fn run(prepared: &mut SupervisorStart) -> Result<(), Box<dyn std::erro
         // A previously blocked emergency brake gets first claim on a gate
         // that became free during the sleep. Otherwise the next read can
         // repeatedly reacquire it and starve actuation.
-        if pending_intent == Some(BrakeIntent::Apply)
-            && dispatch_due_or_pending(
-                &machine.snapshot(),
+        if pending_intent == Some(BrakeIntent::Apply) {
+            dispatch_and_record(
+                &mut machine,
                 &actuator,
                 &nvml_gate,
                 DispatchAttempt {
@@ -285,9 +285,7 @@ pub async fn run(prepared: &mut SupervisorStart) -> Result<(), Box<dyn std::erro
                     pending: &mut pending_intent,
                     due: false,
                 },
-            )
-        {
-            machine.apply_dispatched();
+            );
         }
         let raw = acquire_raw_with_timeout(
             &nvml_gate,
@@ -401,8 +399,8 @@ pub async fn run(prepared: &mut SupervisorStart) -> Result<(), Box<dyn std::erro
             let _ = try_publish_isolated(publisher.as_ref(), &telemetry.to_sensory_mapping());
         }
 
-        if dispatch_due_or_pending(
-            &machine.snapshot(),
+        dispatch_and_record(
+            &mut machine,
             &actuator,
             &nvml_gate,
             DispatchAttempt {
@@ -410,9 +408,7 @@ pub async fn run(prepared: &mut SupervisorStart) -> Result<(), Box<dyn std::erro
                 pending: &mut pending_intent,
                 due: dispatch_due,
             },
-        ) {
-            machine.apply_dispatched();
-        }
+        );
 
         {
             let mut metrics = relay_metrics.lock().unwrap();
@@ -933,6 +929,19 @@ struct DispatchAttempt<'a> {
     due: bool,
 }
 
+/// Dispatch from the machine's current snapshot and record an actually spawned
+/// apply on the machine ([`SafetyMachine::apply_dispatched`]).
+fn dispatch_and_record(
+    machine: &mut SafetyMachine,
+    actuator: &Arc<dyn SafetyActuator>,
+    gate: &NvmlGate,
+    attempt: DispatchAttempt<'_>,
+) {
+    if dispatch_due_or_pending(&machine.snapshot(), actuator, gate, attempt) {
+        machine.apply_dispatched();
+    }
+}
+
 /// Retry only intents skipped because another NVML worker held the gate.
 /// Reconcile with the latest safety snapshot before any retry.
 ///
@@ -1277,10 +1286,12 @@ mod tests {
                 due: false,
             },
         );
-        assert!(spawned, "the retried apply worker was spawned");
-        assert_eq!(pending, None);
-        assert!(brake_task.take().unwrap().await.unwrap().is_ok());
-        assert_eq!(fake.apply_calls(), 1);
+        let applied = brake_task.take().unwrap().await.unwrap().is_ok();
+        assert_eq!(
+            (spawned, pending, applied, fake.apply_calls()),
+            (true, None, true, 1),
+            "the retried apply worker was spawned and ran"
+        );
     }
 
     #[tokio::test]
@@ -1316,10 +1327,10 @@ mod tests {
                 due: false,
             },
         );
-        assert!(!spawned);
-        assert_eq!(pending, None);
-        assert!(brake_task.is_none());
-        assert_eq!(fake.apply_calls(), 0);
+        assert_eq!(
+            (spawned, pending, brake_task.is_none(), fake.apply_calls()),
+            (false, None, true, 0)
+        );
     }
 
     /// Blocks review (PR #85, thread 4311678277): a gate-busy Apply that is
