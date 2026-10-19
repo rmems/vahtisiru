@@ -218,52 +218,99 @@ fn deterministic_path_is_identical_with_learned_component_absent_panicking_garba
     }
 }
 
+/// Lexer state for [`strip_comments`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LexState {
+    Code,
+    LineComment,
+    /// Nesting depth of `/* */` (always >= 1).
+    BlockComment(usize),
+    Str,
+    Char,
+}
+
+/// One step: the state after consuming `c`, and how many extra chars
+/// (beyond `c`) were consumed as part of a two-char token.
+type Step = (LexState, usize);
+
+fn lex_code(c: char, next: Option<char>, after: Option<char>, out: &mut String) -> Step {
+    match (c, next) {
+        ('/', Some('/')) => return (LexState::LineComment, 1),
+        ('/', Some('*')) => return (LexState::BlockComment(1), 1),
+        _ => {}
+    }
+    // A char literal ('x' or '\n'), not a lifetime like 'a or 'static.
+    let is_char = c == '\'' && (next == Some('\\') || after == Some('\''));
+    out.push(c);
+    match c {
+        '"' => (LexState::Str, 0),
+        _ if is_char => (LexState::Char, 0),
+        _ => (LexState::Code, 0),
+    }
+}
+
+fn lex_line_comment(c: char, out: &mut String) -> Step {
+    if c == '\n' {
+        out.push(c);
+        return (LexState::Code, 0);
+    }
+    (LexState::LineComment, 0)
+}
+
+fn lex_block_comment(depth: usize, c: char, next: Option<char>) -> Step {
+    match (c, next) {
+        ('/', Some('*')) => (LexState::BlockComment(depth + 1), 1),
+        ('*', Some('/')) if depth == 1 => (LexState::Code, 1),
+        ('*', Some('/')) => (LexState::BlockComment(depth - 1), 1),
+        _ => (LexState::BlockComment(depth), 0),
+    }
+}
+
+/// Inside a string or char literal: keep everything, honour `\` escapes,
+/// and leave on the matching closing quote.
+fn lex_literal(
+    state: LexState,
+    quote: char,
+    c: char,
+    next: Option<char>,
+    out: &mut String,
+) -> Step {
+    out.push(c);
+    match (c, next) {
+        ('\\', Some(escaped)) => {
+            out.push(escaped);
+            (state, 1)
+        }
+        _ if c == quote => (LexState::Code, 0),
+        _ => (state, 0),
+    }
+}
+
 /// Remove `//` line comments (leading or trailing) and nested `/* */` block
 /// comments, keeping string and char literal contents. Enough of a lexer for
 /// the structural check; not a general Rust tokenizer (raw strings with `"#`
 /// delimiters are treated as ordinary strings).
 fn strip_comments(src: &str) -> String {
-    let b = src.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let (mut i, mut depth, mut in_str) = (0, 0usize, false);
-    while i < b.len() {
-        let next = b.get(i + 1).copied();
-        if depth > 0 {
-            match (b[i], next) {
-                (b'/', Some(b'*')) => (depth, i) = (depth + 1, i + 2),
-                (b'*', Some(b'/')) => (depth, i) = (depth - 1, i + 2),
-                _ => i += 1,
-            }
-        } else if in_str {
-            out.push(b[i]);
-            match b[i] {
-                b'\\' if next.is_some() => {
-                    out.push(b[i + 1]);
-                    i += 2;
-                }
-                b'"' => (in_str, i) = (false, i + 1),
-                _ => i += 1,
-            }
-        } else {
-            match (b[i], next) {
-                (b'/', Some(b'/')) => {
-                    while i < b.len() && b[i] != b'\n' {
-                        i += 1;
-                    }
-                }
-                (b'/', Some(b'*')) => (depth, i) = (1, i + 2),
-                (b'"', _) => {
-                    out.push(b'"');
-                    (in_str, i) = (true, i + 1);
-                }
-                (c, _) => {
-                    out.push(c);
-                    i += 1;
-                }
-            }
-        }
+    let chars: Vec<char> = src.chars().collect();
+    let mut out = String::with_capacity(src.len());
+    let (mut state, mut i) = (LexState::Code, 0);
+    while i < chars.len() {
+        let (c, next, after) = (
+            chars[i],
+            chars.get(i + 1).copied(),
+            chars.get(i + 2).copied(),
+        );
+        let (new_state, extra) = match state {
+            LexState::Code => lex_code(c, next, after, &mut out),
+            LexState::LineComment => lex_line_comment(c, &mut out),
+            LexState::BlockComment(depth) => lex_block_comment(depth, c, next),
+            LexState::Str => lex_literal(state, '"', c, next, &mut out),
+            LexState::Char => lex_literal(state, '\'', c, next, &mut out),
+        };
+        state = new_state;
+        i += 1 + extra;
     }
-    String::from_utf8(out).expect("comment stripping preserves UTF-8")
+    out
 }
 
 #[test]
@@ -279,6 +326,9 @@ fn strip_comments_removes_trailing_and_block_comments_only() {
         "{got}"
     );
     assert_eq!(got.matches("tokio").count(), 1, "{got}");
+    // A '"' char literal must not open a string; lifetimes are not chars.
+    let got = strip_comments("let q = '\"'; // tokio\nfn f<'a>(x: &'a str) {} // corpus_ipc");
+    assert_eq!(got, "let q = '\"'; \nfn f<'a>(x: &'a str) {} ");
 }
 
 #[test]
