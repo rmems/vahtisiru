@@ -473,10 +473,15 @@ impl SafetyMachine {
         if trip.is_some() {
             self.trip_latched = true;
             self.trips_total = self.trips_total.saturating_add(1);
-        } else if !desired_brake && !self.brake_engaged && !self.apply_pending {
+        } else if self.trip_episode_can_close(desired_brake) {
             self.trip_latched = false;
         }
         trip
+    }
+
+    /// The brake is off for real: not wanted, not engaged, no apply in flight.
+    fn trip_episode_can_close(&self, desired_brake: bool) -> bool {
+        !desired_brake && !self.brake_engaged && !self.apply_pending
     }
 
     /// Record a completed actuator attempt. Does not re-read telemetry.
