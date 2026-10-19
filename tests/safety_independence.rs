@@ -872,8 +872,10 @@ fn warn_frame_while_release_in_flight_is_not_a_new_trip() {
 #[test]
 fn healthy_frame_while_apply_in_flight_does_not_reopen_the_episode() {
     let mut m = machine();
+    let first = m.evaluate(&frame(90.0, 200.0));
+    m.apply_dispatched(); // the supervisor spawned the apply worker
     let steps = [
-        m.evaluate(&frame(90.0, 200.0)),
+        first,
         m.evaluate(&frame(60.0, 200.0)),
         m.record_actuator(ActuatorOutcome::Applied),
         m.evaluate(&frame(90.0, 200.0)),
@@ -900,10 +902,31 @@ fn healthy_frame_while_apply_in_flight_does_not_reopen_the_episode() {
 
 /// A failed apply leaves nothing in flight: once readings are healthy the
 /// episode closes, and a later critical reading is a new trip.
+/// Blocks review (PR #85, thread 4311678277): an Apply intent that was never
+/// dispatched (gate busy, then dropped once the intent changed) is not in
+/// flight and must not hold the episode open forever.
+#[test]
+fn undispatched_apply_does_not_swallow_the_next_trip() {
+    let mut m = machine();
+    let mut frames = vec![frame(90.0, 200.0)];
+    frames.extend([frame(60.0, 200.0), frame(60.0, 200.0), frame(60.0, 200.0)]);
+    frames.push(frame(90.0, 200.0));
+    let steps: Vec<_> = frames.iter().map(|f| m.evaluate(f)).collect();
+    let trips: Vec<_> = steps.iter().map(|s| s.trip).collect();
+    let critical = Some(SafetyReason::ThermalCritical);
+    assert_eq!(
+        (trips, m.trips_total()),
+        (vec![critical, None, None, None, critical], 2)
+    );
+    let desired: Vec<_> = steps.iter().map(|s| s.desired_brake).collect();
+    assert_eq!(desired, [true, false, false, false, true]);
+}
+
 #[test]
 fn failed_apply_then_healthy_closes_the_episode() {
     let mut m = machine();
     let _ = m.evaluate(&frame(90.0, 200.0));
+    m.apply_dispatched();
     let _ = m.record_actuator(ActuatorOutcome::ApplyFailed("sudo denied".into()));
     assert_eq!(
         m.evaluate(&frame(60.0, 200.0)).state,

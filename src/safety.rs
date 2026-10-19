@@ -438,22 +438,27 @@ impl SafetyMachine {
         self.last_policy_state = policy_state;
         self.last_reason = assessment.reason;
         self.reason_code = assessment.code;
-        if SafetySnapshot::intent_from(desired_brake, self.brake_engaged) == BrakeIntent::Apply {
-            // The supervisor may dispatch this apply off the evaluation path;
-            // until its outcome is recorded the brake may still come on.
-            self.apply_pending = true;
-        }
         let trip = self.update_trip_latch(assessment.kind, desired_brake);
         self.compose_and_store(desired_brake, false, trip)
+    }
+
+    /// The supervisor actually dispatched an apply (worker spawned). Until
+    /// [`Self::record_actuator`] reports `Applied` or `ApplyFailed`, the brake
+    /// may still come on, so the open trip episode is held. An `Apply` intent
+    /// that is never dispatched (for example dropped after the NVML gate was
+    /// busy) does not hold the episode. Bookkeeping only; never affects brake
+    /// decisions.
+    pub fn apply_dispatched(&mut self) {
+        self.apply_pending = true;
     }
 
     /// Trip bookkeeping only; never affects brake decisions.
     ///
     /// A trip is a fail-closed classification (critical, missing, invalid,
     /// stale) while no trip episode is open. The episode stays open until an
-    /// evaluation finds the brake neither wanted, engaged, nor with an apply
-    /// still in flight (Apply intent not yet answered by `Applied` or
-    /// `ApplyFailed`), so holding,
+    /// evaluation finds the brake neither wanted, engaged, nor with a
+    /// dispatched apply still in flight (see [`Self::apply_dispatched`]), so
+    /// holding,
     /// re-applying after release, recovery, and late actuator acks (handled
     /// in [`Self::record_actuator`], which never touches the latch) are not
     /// new trips.

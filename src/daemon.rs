@@ -275,8 +275,8 @@ pub async fn run(prepared: &mut SupervisorStart) -> Result<(), Box<dyn std::erro
         // A previously blocked emergency brake gets first claim on a gate
         // that became free during the sleep. Otherwise the next read can
         // repeatedly reacquire it and starve actuation.
-        if pending_intent == Some(BrakeIntent::Apply) {
-            dispatch_due_or_pending(
+        if pending_intent == Some(BrakeIntent::Apply)
+            && dispatch_due_or_pending(
                 &machine.snapshot(),
                 &actuator,
                 &nvml_gate,
@@ -285,7 +285,9 @@ pub async fn run(prepared: &mut SupervisorStart) -> Result<(), Box<dyn std::erro
                     pending: &mut pending_intent,
                     due: false,
                 },
-            );
+            )
+        {
+            machine.apply_dispatched();
         }
         let raw = acquire_raw_with_timeout(
             &nvml_gate,
@@ -399,7 +401,7 @@ pub async fn run(prepared: &mut SupervisorStart) -> Result<(), Box<dyn std::erro
             let _ = try_publish_isolated(publisher.as_ref(), &telemetry.to_sensory_mapping());
         }
 
-        dispatch_due_or_pending(
+        if dispatch_due_or_pending(
             &machine.snapshot(),
             &actuator,
             &nvml_gate,
@@ -408,7 +410,9 @@ pub async fn run(prepared: &mut SupervisorStart) -> Result<(), Box<dyn std::erro
                 pending: &mut pending_intent,
                 due: dispatch_due,
             },
-        );
+        ) {
+            machine.apply_dispatched();
+        }
 
         {
             let mut metrics = relay_metrics.lock().unwrap();
@@ -931,24 +935,25 @@ struct DispatchAttempt<'a> {
 
 /// Retry only intents skipped because another NVML worker held the gate.
 /// Reconcile with the latest safety snapshot before any retry.
+///
+/// Returns `true` only when an apply worker was actually spawned; the caller
+/// must then call [`SafetyMachine::apply_dispatched`].
+#[must_use]
 fn dispatch_due_or_pending(
     snap: &SafetySnapshot,
     actuator: &Arc<dyn SafetyActuator>,
     gate: &NvmlGate,
     attempt: DispatchAttempt<'_>,
-) {
+) -> bool {
     if *attempt.pending != Some(snap.intent) {
         *attempt.pending = None;
     }
     if !attempt.due && attempt.pending.is_none() {
-        return;
+        return false;
     }
-    *attempt.pending = match spawn_intent(snap, actuator, gate, attempt.slots) {
-        DispatchResult::GateBusy => Some(snap.intent),
-        DispatchResult::Spawned | DispatchResult::AlreadyInFlight | DispatchResult::NoIntent => {
-            None
-        }
-    };
+    let result = spawn_intent(snap, actuator, gate, attempt.slots);
+    *attempt.pending = (result == DispatchResult::GateBusy).then_some(snap.intent);
+    result == DispatchResult::Spawned && snap.intent == BrakeIntent::Apply
 }
 
 /// Dispatch the machine's [`BrakeIntent`] onto a blocking worker so the
@@ -1247,7 +1252,7 @@ mod tests {
         let mut release_task = None;
         let mut pending = None;
 
-        dispatch_due_or_pending(
+        let spawned = dispatch_due_or_pending(
             &snap,
             &actuator,
             &gate,
@@ -1257,11 +1262,12 @@ mod tests {
                 due: true,
             },
         );
+        assert!(!spawned, "a gate-blocked apply is not in flight");
         assert_eq!(pending, Some(BrakeIntent::Apply));
         assert!(brake_task.is_none());
         drop(permit);
 
-        dispatch_due_or_pending(
+        let spawned = dispatch_due_or_pending(
             &snap,
             &actuator,
             &gate,
@@ -1271,6 +1277,7 @@ mod tests {
                 due: false,
             },
         );
+        assert!(spawned, "the retried apply worker was spawned");
         assert_eq!(pending, None);
         assert!(brake_task.take().unwrap().await.unwrap().is_ok());
         assert_eq!(fake.apply_calls(), 1);
@@ -1299,7 +1306,7 @@ mod tests {
         let mut brake_task = None;
         let mut release_task = None;
 
-        dispatch_due_or_pending(
+        let spawned = dispatch_due_or_pending(
             &snap,
             &actuator,
             &gate,
@@ -1309,9 +1316,55 @@ mod tests {
                 due: false,
             },
         );
+        assert!(!spawned);
         assert_eq!(pending, None);
         assert!(brake_task.is_none());
         assert_eq!(fake.apply_calls(), 0);
+    }
+
+    /// Blocks review (PR #85, thread 4311678277): a gate-busy Apply that is
+    /// later dropped was never in flight, so the trip episode can close and
+    /// the next real critical reading is reported as a new trip.
+    #[tokio::test]
+    async fn gate_busy_then_dropped_apply_leaves_trip_episode_closable() {
+        use crate::safety::{FakeActuator, SafetyReason};
+        use crate::telemetry::{assess, fixtures};
+
+        let frame = |temp_c| {
+            let mut raw = fixtures::healthy_real();
+            raw.gpu_temp_c = Some(temp_c);
+            assess(&raw, fixtures::NOW)
+        };
+        let gate = NvmlGate::default();
+        let permit = gate.try_enter().unwrap();
+        let actuator: Arc<dyn SafetyActuator> = Arc::new(FakeActuator::new());
+        let (mut brake_task, mut release_task, mut pending) = (None, None, None);
+        let mut machine = crate::safety::test_machine();
+        let mut step = |machine: &mut SafetyMachine, temp_c, due| {
+            let snap = machine.evaluate(&frame(temp_c));
+            let attempt = DispatchAttempt {
+                slots: (&mut brake_task, &mut release_task),
+                pending: &mut pending,
+                due,
+            };
+            if dispatch_due_or_pending(&snap, &actuator, &gate, attempt) {
+                machine.apply_dispatched();
+            }
+            snap.trip
+        };
+        assert_eq!(
+            step(&mut machine, 90.0, true),
+            Some(SafetyReason::ThermalCritical)
+        );
+        assert_eq!(step(&mut machine, 60.0, false), None); // pending Apply dropped
+        drop(permit);
+        assert_eq!(step(&mut machine, 60.0, false), None);
+        assert_eq!(
+            step(&mut machine, 90.0, true),
+            Some(SafetyReason::ThermalCritical)
+        );
+        assert_eq!(machine.trips_total(), 2);
+        assert!(brake_task.is_some(), "the second apply really was spawned");
     }
 
     #[tokio::test]

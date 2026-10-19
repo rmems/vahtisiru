@@ -118,8 +118,12 @@ Free-text `last_reason` stays for logs only and is never a metric label.
 `SafetySnapshot::trip` is `Some(code)` only on the `evaluate` step that opens a
 fail-closed episode: a critical, missing, invalid or stale classification
 while no episode is open. The episode stays open until an evaluation finds the
-brake not wanted, not engaged, and with no apply still in flight (an `Apply`
-intent not yet answered by `Applied` or `ApplyFailed`). So holding the brake, a warn-band re-apply
+brake not wanted, not engaged, and with no apply still in flight. "In flight"
+means the supervisor actually spawned the apply worker
+(`SafetyMachine::apply_dispatched`) and `Applied` or `ApplyFailed` has not been
+recorded yet. An `Apply` intent that is never dispatched, for example parked
+while the NVML gate is busy and then dropped when the intent changes, does not
+hold the episode open, so the next real trip is still reported. So holding the brake, a warn-band re-apply
 right after a release, a warn frame while a release is in flight, recovery,
 and late actuator acks are not new trips. `record_actuator` never emits a trip,
 and adopting a leftover brake opens an episode without counting one. This
