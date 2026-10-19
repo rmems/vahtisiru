@@ -208,94 +208,27 @@ impl Supervisor {
         let raw = self.acquire_raw_with_timeout().await;
         let telemetry = self.assess(&raw);
 
-        let mut evaluated_this_iter = false;
-        let mut actuation_failed_this_tick = false;
-        let mut dispatch_due = false;
+        // Reconcile workers that finished during the sleep. A success already
+        // re-read and re-evaluated telemetry; a failure is recorded as-is.
         let mut actuation = None;
-
-        if self
-            .brake_task
-            .as_ref()
-            .is_some_and(JoinHandle::is_finished)
-        {
-            let task = self.brake_task.take().expect("finished brake task exists");
-            let outcome = match task.await {
-                Ok(Ok(())) => ActuatorOutcome::Applied,
-                Ok(Err(e)) => {
-                    eprintln!("[relay] Emergency brake failed: {e}");
-                    ActuatorOutcome::ApplyFailed(e.to_string())
+        let mut succeeded = false;
+        let mut failed = false;
+        for kind in [ActuationKind::Apply, ActuationKind::Release] {
+            if let Some(outcome) = self.reconcile_finished(kind).await {
+                if outcome_succeeded(&outcome) {
+                    succeeded = true;
+                } else {
+                    failed = true;
                 }
-                Err(e) => {
-                    eprintln!("[relay] Brake task panicked: {e}");
-                    ActuatorOutcome::ApplyFailed(e.to_string())
-                }
-            };
-            if matches!(outcome, ActuatorOutcome::Applied) {
-                self.reassess_after_actuation(outcome.clone()).await;
-                dispatch_due = true;
-                evaluated_this_iter = true;
-            } else {
-                let snap = self.machine.record_actuator(outcome.clone());
-                self.store_safety(&snap);
-                actuation_failed_this_tick = true;
+                actuation = Some(outcome);
             }
-            actuation = Some(outcome);
-        }
-        if self
-            .release_task
-            .as_ref()
-            .is_some_and(JoinHandle::is_finished)
-        {
-            let task = self
-                .release_task
-                .take()
-                .expect("finished release task exists");
-            let outcome = match task.await {
-                Ok(Ok(())) => ActuatorOutcome::Released,
-                Ok(Err(e)) => {
-                    eprintln!("[relay] Brake release failed: {e}");
-                    ActuatorOutcome::ReleaseFailed(e.to_string())
-                }
-                Err(e) => {
-                    eprintln!("[relay] Brake release task panicked: {e}");
-                    ActuatorOutcome::ReleaseFailed(e.to_string())
-                }
-            };
-            if matches!(outcome, ActuatorOutcome::Released) {
-                self.reassess_after_actuation(outcome.clone()).await;
-                dispatch_due = true;
-                evaluated_this_iter = true;
-            } else {
-                let snap = self.machine.record_actuator(outcome.clone());
-                self.store_safety(&snap);
-                actuation_failed_this_tick = true;
-            }
-            actuation = Some(outcome);
         }
 
-        // First acquired frame is evaluated immediately (fail-closed startup).
-        // Later evaluations keep the every-10-ticks cadence.
-        // Do not spawn from the pre-telemetry snapshot: SoftwareFallback holds
-        // rather than applies, which only classify_frame can decide.
-        if !evaluated_this_iter && should_evaluate_tick(step_count, telemetry.source) {
-            let prior_intent = self.machine.snapshot().intent;
-            let (snap, pub_res) =
-                evaluate_then_try_publish(&mut self.machine, &telemetry, self.publisher.as_ref());
-            let _ = pub_res;
-            self.store_safety(&snap);
-            dispatch_due = should_dispatch_intent(
-                step_count,
-                prior_intent,
-                snap.intent,
-                actuation_failed_this_tick,
-            );
-        } else if !evaluated_this_iter {
-            // Publication is outside the safety critical path and never awaited.
-            let _ = self
-                .publisher
-                .try_publish(&telemetry.to_sensory_mapping_at((self.clock)()));
-        }
-
+        let dispatch_due = if succeeded {
+            true
+        } else {
+            self.evaluate_or_publish(step_count, &telemetry, failed)
+        };
         dispatched |= self.dispatch_due_or_pending(dispatch_due);
 
         {
@@ -317,6 +250,61 @@ impl Supervisor {
             dispatched,
             pending_intent: self.pending_intent,
         }
+    }
+
+    /// Join the worker in `kind`'s slot if it has finished. On success the
+    /// outcome is recorded and telemetry is re-read and re-evaluated before
+    /// any further dispatch; on failure only the outcome is recorded.
+    async fn reconcile_finished(&mut self, kind: ActuationKind) -> Option<ActuatorOutcome> {
+        let slot = match kind {
+            ActuationKind::Apply => &mut self.brake_task,
+            ActuationKind::Release => &mut self.release_task,
+        };
+        if !slot.as_ref().is_some_and(JoinHandle::is_finished) {
+            return None;
+        }
+        let task = slot.take().expect("finished task exists");
+        let outcome = actuation_outcome(kind, task.await);
+        if outcome_succeeded(&outcome) {
+            self.reassess_after_actuation(outcome.clone()).await;
+        } else {
+            let snap = self.machine.record_actuator(outcome.clone());
+            self.store_safety(&snap);
+        }
+        Some(outcome)
+    }
+
+    /// Evaluate the frame on the safety cadence, otherwise only publish it.
+    /// Returns whether the resulting intent is due for dispatch.
+    ///
+    /// The first acquired frame is evaluated immediately (fail-closed
+    /// startup); later evaluations keep the every-10-ticks cadence. Never
+    /// spawn from the pre-telemetry snapshot: SoftwareFallback holds rather
+    /// than applies, which only `classify_frame` can decide.
+    fn evaluate_or_publish(
+        &mut self,
+        step_count: u64,
+        telemetry: &TelemetryFrame,
+        actuation_failed_this_tick: bool,
+    ) -> bool {
+        if !should_evaluate_tick(step_count, telemetry.source) {
+            // Publication is outside the safety critical path and never awaited.
+            let _ = self
+                .publisher
+                .try_publish(&telemetry.to_sensory_mapping_at((self.clock)()));
+            return false;
+        }
+        let prior_intent = self.machine.snapshot().intent;
+        let (snap, pub_res) =
+            evaluate_then_try_publish(&mut self.machine, telemetry, self.publisher.as_ref());
+        let _ = pub_res;
+        self.store_safety(&snap);
+        should_dispatch_intent(
+            step_count,
+            prior_intent,
+            snap.intent,
+            actuation_failed_this_tick,
+        )
     }
 
     fn assess(&mut self, raw: &RawTelemetry) -> TelemetryFrame {
@@ -405,105 +393,146 @@ impl Supervisor {
         let snap = self.machine.snapshot();
         let in_flight = self.in_flight();
         let plan = plan_shutdown(reason, &snap, in_flight);
-
-        println!();
-        eprintln!(
-            "[relay] shutdown reason={} state={} policy_state={} brake_engaged={} desired_brake={} \
-             in_flight={} unresolved_brake={} unresolved_actuator={} actuation={} ({})",
-            plan.reason.as_str(),
-            snap.state.as_str(),
-            snap.policy_state.as_str(),
-            snap.brake_engaged,
-            snap.desired_brake,
-            in_flight.as_str(),
-            plan.unresolved_brake,
-            plan.unresolved_actuator,
-            plan.actuation.as_str(),
-            plan.summary,
-        );
-        tracing::info!(
-            reason = plan.reason.as_str(),
-            state = snap.state.as_str(),
-            policy_state = snap.policy_state.as_str(),
-            brake_engaged = snap.brake_engaged,
-            desired_brake = snap.desired_brake,
-            in_flight = in_flight.as_str(),
-            unresolved_brake = plan.unresolved_brake,
-            unresolved_actuator = plan.unresolved_actuator,
-            actuation = plan.actuation.as_str(),
-            summary = plan.summary,
-            "orderly shutdown (fail-closed: no new power-limit restore)"
-        );
-
+        log_shutdown_plan(&snap, in_flight, &plan);
         {
             let mut metrics = self.relay_metrics.lock().unwrap();
             cpu::record_shutdown(&mut metrics, &plan);
         }
 
-        match plan.actuation {
-            ShutdownActuation::Idle => {
-                if let Some(task) = self.brake_task.take() {
-                    task.abort();
-                }
-                if let Some(task) = self.release_task.take() {
-                    task.abort();
-                }
-            }
-            ShutdownActuation::AwaitApply => {
-                if let Some(task) = self.brake_task.take() {
-                    match join_in_flight(task, SHUTDOWN_ACTUATOR_TIMEOUT).await {
-                        InFlightJoin::Succeeded => {
-                            let snap = self.machine.record_actuator(ActuatorOutcome::Applied);
-                            self.store_safety(&snap);
-                        }
-                        InFlightJoin::Failed(e) | InFlightJoin::Panicked(e) => {
-                            eprintln!("[relay] shutdown: in-flight apply did not succeed: {e}");
-                            let snap = self
-                                .machine
-                                .record_actuator(ActuatorOutcome::ApplyFailed(e));
-                            self.store_safety(&snap);
-                        }
-                        InFlightJoin::TimedOut => {
-                            eprintln!(
-                                "[relay] shutdown: in-flight apply timed out; leaving hardware unchanged"
-                            );
-                        }
-                    }
-                }
-                if let Some(task) = self.release_task.take() {
-                    task.abort();
-                }
-            }
-            ShutdownActuation::AwaitAuthorizedRelease => {
-                if let Some(task) = self.release_task.take() {
-                    match join_in_flight(task, SHUTDOWN_ACTUATOR_TIMEOUT).await {
-                        InFlightJoin::Succeeded => {
-                            let snap = self.machine.record_actuator(ActuatorOutcome::Released);
-                            self.store_safety(&snap);
-                        }
-                        InFlightJoin::Failed(e) | InFlightJoin::Panicked(e) => {
-                            eprintln!("[relay] shutdown: in-flight release did not succeed: {e}");
-                            let snap = self
-                                .machine
-                                .record_actuator(ActuatorOutcome::ReleaseFailed(e));
-                            self.store_safety(&snap);
-                        }
-                        InFlightJoin::TimedOut => {
-                            eprintln!(
-                                "[relay] shutdown: in-flight release timed out; leaving brake engaged"
-                            );
-                        }
-                    }
-                }
-                if let Some(task) = self.brake_task.take() {
-                    task.abort();
-                }
+        // Await (bounded) only the actuation the plan authorizes; abort the
+        // other slot. Idle aborts both and never starts a new actuation.
+        let awaited = match plan.actuation {
+            ShutdownActuation::Idle => None,
+            ShutdownActuation::AwaitApply => Some(ActuationKind::Apply),
+            ShutdownActuation::AwaitAuthorizedRelease => Some(ActuationKind::Release),
+        };
+        for kind in [ActuationKind::Apply, ActuationKind::Release] {
+            let slot = match kind {
+                ActuationKind::Apply => &mut self.brake_task,
+                ActuationKind::Release => &mut self.release_task,
+            };
+            let Some(task) = slot.take() else { continue };
+            if awaited == Some(kind) {
+                self.await_in_flight(kind, task).await;
+            } else {
+                task.abort();
             }
         }
 
         shutdown_metrics_collector(metrics_shutdown, metrics_task, SHUTDOWN_METRICS_TIMEOUT).await;
         plan
     }
+
+    /// Bounded join of an already-running actuation during shutdown; the
+    /// outcome is recorded, a timeout leaves hardware and machine unchanged.
+    async fn await_in_flight(&mut self, kind: ActuationKind, task: ActuationTask) {
+        let label = kind.label();
+        match join_in_flight(task, SHUTDOWN_ACTUATOR_TIMEOUT).await {
+            InFlightJoin::Succeeded => {
+                let snap = self.machine.record_actuator(kind.success());
+                self.store_safety(&snap);
+            }
+            InFlightJoin::Failed(e) | InFlightJoin::Panicked(e) => {
+                eprintln!("[relay] shutdown: in-flight {label} did not succeed: {e}");
+                let snap = self.machine.record_actuator(kind.failure(e));
+                self.store_safety(&snap);
+            }
+            InFlightJoin::TimedOut => {
+                let consequence = match kind {
+                    ActuationKind::Apply => "leaving hardware unchanged",
+                    ActuationKind::Release => "leaving brake engaged",
+                };
+                eprintln!("[relay] shutdown: in-flight {label} timed out; {consequence}");
+            }
+        }
+    }
+}
+
+/// Which privileged actuation a worker slot carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActuationKind {
+    Apply,
+    Release,
+}
+
+impl ActuationKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Apply => "apply",
+            Self::Release => "release",
+        }
+    }
+
+    fn success(self) -> ActuatorOutcome {
+        match self {
+            Self::Apply => ActuatorOutcome::Applied,
+            Self::Release => ActuatorOutcome::Released,
+        }
+    }
+
+    fn failure(self, reason: String) -> ActuatorOutcome {
+        match self {
+            Self::Apply => ActuatorOutcome::ApplyFailed(reason),
+            Self::Release => ActuatorOutcome::ReleaseFailed(reason),
+        }
+    }
+}
+
+fn outcome_succeeded(outcome: &ActuatorOutcome) -> bool {
+    matches!(
+        outcome,
+        ActuatorOutcome::Applied | ActuatorOutcome::Released
+    )
+}
+
+/// Map a joined worker result onto the machine's outcome vocabulary. A
+/// panicking worker is an actuation failure, never a supervisor crash.
+fn actuation_outcome(
+    kind: ActuationKind,
+    joined: Result<Result<(), ActuatorError>, tokio::task::JoinError>,
+) -> ActuatorOutcome {
+    match joined {
+        Ok(Ok(())) => kind.success(),
+        Ok(Err(e)) => {
+            eprintln!("[relay] Emergency brake {} failed: {e}", kind.label());
+            kind.failure(e.to_string())
+        }
+        Err(e) => {
+            eprintln!("[relay] Brake {} task panicked: {e}", kind.label());
+            kind.failure(e.to_string())
+        }
+    }
+}
+
+fn log_shutdown_plan(snap: &SafetySnapshot, in_flight: InFlightActuation, plan: &ShutdownPlan) {
+    println!();
+    eprintln!(
+        "[relay] shutdown reason={} state={} policy_state={} brake_engaged={} desired_brake={} \
+         in_flight={} unresolved_brake={} unresolved_actuator={} actuation={} ({})",
+        plan.reason.as_str(),
+        snap.state.as_str(),
+        snap.policy_state.as_str(),
+        snap.brake_engaged,
+        snap.desired_brake,
+        in_flight.as_str(),
+        plan.unresolved_brake,
+        plan.unresolved_actuator,
+        plan.actuation.as_str(),
+        plan.summary,
+    );
+    tracing::info!(
+        reason = plan.reason.as_str(),
+        state = snap.state.as_str(),
+        policy_state = snap.policy_state.as_str(),
+        brake_engaged = snap.brake_engaged,
+        desired_brake = snap.desired_brake,
+        in_flight = in_flight.as_str(),
+        unresolved_brake = plan.unresolved_brake,
+        unresolved_actuator = plan.unresolved_actuator,
+        actuation = plan.actuation.as_str(),
+        summary = plan.summary,
+        "orderly shutdown (fail-closed: no new power-limit restore)"
+    );
 }
 
 fn should_evaluate_tick(step_count: u64, source: TelemetrySource) -> bool {
@@ -552,20 +581,10 @@ fn log_safety_snapshot(snap: &SafetySnapshot, warned_brake_held_sim: &mut bool) 
             snap.last_reason
         );
     }
+    if let Some(level) = alert_level_on_transition(snap) {
+        eprintln!("[relay] SAFETY {level}: {}", snap.last_reason);
+    }
     match snap.state {
-        SafetyState::CriticalBraked
-        | SafetyState::TelemetryMissing
-        | SafetyState::TelemetryStale
-        | SafetyState::TelemetryInvalid => {
-            if snap.transition.is_some() {
-                eprintln!("[relay] SAFETY CRITICAL: {}", snap.last_reason);
-            }
-        }
-        SafetyState::Warning => {
-            if snap.transition.is_some() {
-                eprintln!("[relay] SAFETY WARN: {}", snap.last_reason);
-            }
-        }
         SafetyState::SimulatedSoftwareOnly if snap.brake_engaged => {
             if !*warned_brake_held_sim {
                 eprintln!(
@@ -584,6 +603,24 @@ fn log_safety_snapshot(snap: &SafetySnapshot, warned_brake_held_sim: &mut bool) 
         SafetyState::HealthyReal | SafetyState::Recovering | SafetyState::SimulatedSoftwareOnly => {
             *warned_brake_held_sim = false;
         }
+        SafetyState::CriticalBraked
+        | SafetyState::TelemetryMissing
+        | SafetyState::TelemetryStale
+        | SafetyState::TelemetryInvalid
+        | SafetyState::Warning => {}
+    }
+}
+
+/// Alert line emitted only when a step enters a critical or warning state.
+fn alert_level_on_transition(snap: &SafetySnapshot) -> Option<&'static str> {
+    snap.transition?;
+    match snap.state {
+        SafetyState::CriticalBraked
+        | SafetyState::TelemetryMissing
+        | SafetyState::TelemetryStale
+        | SafetyState::TelemetryInvalid => Some("CRITICAL"),
+        SafetyState::Warning => Some("WARN"),
+        _ => None,
     }
 }
 
