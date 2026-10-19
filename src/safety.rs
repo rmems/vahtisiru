@@ -10,7 +10,9 @@
 //! Named states and hysteresis are documented in the repository file
 //! `docs/safety.md`. This machine does not run neural computation.
 
-use crate::telemetry::{SampleValidity, TelemetryFrame, TelemetrySample, TelemetrySource};
+use crate::telemetry::{
+    SampleValidity, TelemetryFrame, TelemetrySample, TelemetrySource, UnixMillis,
+};
 use std::sync::Mutex;
 
 mod policy;
@@ -338,6 +340,7 @@ pub struct SafetyMachine {
     last_reason: String,
     reason_code: SafetyReason,
     trip_latched: bool,
+    apply_pending: bool,
     transitions_total: u64,
     actuator_failures_total: u64,
     trips_total: u64,
@@ -376,6 +379,7 @@ impl SafetyMachine {
             last_reason: "no telemetry evaluated yet".to_string(),
             reason_code: SafetyReason::NoTelemetryYet,
             trip_latched: false,
+            apply_pending: false,
             transitions_total: 0,
             actuator_failures_total: 0,
             trips_total: 0,
@@ -434,6 +438,11 @@ impl SafetyMachine {
         self.last_policy_state = policy_state;
         self.last_reason = assessment.reason;
         self.reason_code = assessment.code;
+        if SafetySnapshot::intent_from(desired_brake, self.brake_engaged) == BrakeIntent::Apply {
+            // The supervisor may dispatch this apply off the evaluation path;
+            // until its outcome is recorded the brake may still come on.
+            self.apply_pending = true;
+        }
         let trip = self.update_trip_latch(assessment.kind, desired_brake);
         self.compose_and_store(desired_brake, false, trip)
     }
@@ -442,7 +451,9 @@ impl SafetyMachine {
     ///
     /// A trip is a fail-closed classification (critical, missing, invalid,
     /// stale) while no trip episode is open. The episode stays open until an
-    /// evaluation finds the brake neither wanted nor engaged, so holding,
+    /// evaluation finds the brake neither wanted, engaged, nor with an apply
+    /// still in flight (Apply intent not yet answered by `Applied` or
+    /// `ApplyFailed`), so holding,
     /// re-applying after release, recovery, and late actuator acks (handled
     /// in [`Self::record_actuator`], which never touches the latch) are not
     /// new trips.
@@ -462,7 +473,7 @@ impl SafetyMachine {
         if trip.is_some() {
             self.trip_latched = true;
             self.trips_total = self.trips_total.saturating_add(1);
-        } else if !desired_brake && !self.brake_engaged {
+        } else if !desired_brake && !self.brake_engaged && !self.apply_pending {
             self.trip_latched = false;
         }
         trip
@@ -474,11 +485,13 @@ impl SafetyMachine {
         let mut actuator_failed = false;
         match outcome {
             ActuatorOutcome::Applied => {
+                self.apply_pending = false;
                 self.brake_engaged = true;
                 self.last_actuator_error = None;
                 self.just_released = false;
             }
             ActuatorOutcome::ApplyFailed(err) => {
+                self.apply_pending = false;
                 self.reason_code = SafetyReason::ApplyFailed;
                 self.last_reason = format!("brake apply failed: {err}");
                 self.brake_engaged = false;
@@ -695,7 +708,12 @@ pub fn classify_frame_with_policy(
 fn exceeds_freshness_policy(frame: &TelemetryFrame, policy: &SafetyPolicy) -> bool {
     frame.acquisition_cadence_ms > policy.config.max_acquisition_interval_ms
         || [&frame.gpu_temp_c, &frame.power_w].iter().any(|sample| {
-            frame.acquired_at.saturating_sub(sample.observed_at) >= policy.config.max_sample_age_ms
+            // Explicit age: a future sample has no age and is never "fresh".
+            // (Future samples are already rejected as invalid above.)
+            frame
+                .acquired_at
+                .checked_sub(sample.observed_at)
+                .is_none_or(|age| age >= policy.config.max_sample_age_ms)
         })
 }
 
@@ -788,11 +806,16 @@ impl SafetyChannel {
         }
     }
 
-    /// Finite, inside this channel's contract range, and labelled as this
-    /// channel (a relabelled sample cannot borrow another signal's range).
-    fn accepts(self, sample: &TelemetrySample<f32>, v: f32) -> bool {
+    /// Finite, inside this channel's contract range, labelled as this channel
+    /// (a relabelled sample cannot borrow another signal's range), and not
+    /// observed after its frame was acquired. Zero tolerance, matching
+    /// `TelemetrySample::from_raw` (`observed_at > now` is invalid).
+    fn accepts(self, sample: &TelemetrySample<f32>, v: f32, acquired_at: UnixMillis) -> bool {
         let spec = crate::telemetry::signal_spec(self.signal());
-        sample.signal == self.signal() && v.is_finite() && (spec.min..=spec.max).contains(&v)
+        sample.signal == self.signal()
+            && v.is_finite()
+            && (spec.min..=spec.max).contains(&v)
+            && sample.observed_at <= acquired_at
     }
 }
 
@@ -858,11 +881,14 @@ impl SampleFault {
 /// `Valid` with NaN, ±inf, or an out-of-range value. Such a sample would
 /// otherwise slip through the threshold comparisons (NaN compares false)
 /// and fail open. It is classified `Invalid` instead.
-fn sample_fault(channel: SafetyChannel, sample: &TelemetrySample<f32>) -> Option<SampleFault> {
+fn sample_fault(
+    channel: SafetyChannel,
+    sample: &TelemetrySample<f32>,
+    acquired_at: UnixMillis,
+) -> Option<SampleFault> {
+    let rejected = |v| !channel.accepts(sample, v, acquired_at);
     match sample.validity {
-        SampleValidity::Valid if sample.value.is_some_and(|v| !channel.accepts(sample, v)) => {
-            Some(SampleFault::Invalid)
-        }
+        SampleValidity::Valid if sample.value.is_some_and(rejected) => Some(SampleFault::Invalid),
         SampleValidity::Valid if sample.value.is_some() => None,
         SampleValidity::Valid | SampleValidity::Missing => Some(SampleFault::Missing),
         SampleValidity::Invalid => Some(SampleFault::Invalid),
@@ -873,8 +899,9 @@ fn sample_fault(channel: SafetyChannel, sample: &TelemetrySample<f32>) -> Option
 fn safety_value(
     channel: SafetyChannel,
     sample: &TelemetrySample<f32>,
+    acquired_at: UnixMillis,
 ) -> Result<f32, FrameAssessment> {
-    match (sample_fault(channel, sample), sample.value) {
+    match (sample_fault(channel, sample, acquired_at), sample.value) {
         (None, Some(v)) => Ok(v),
         (Some(fault), _) => Err(fault.assessment(channel)),
         (None, None) => Err(SampleFault::Missing.assessment(channel)),
@@ -883,21 +910,23 @@ fn safety_value(
 
 fn safety_readings(frame: &TelemetryFrame) -> Result<(f32, f32), FrameAssessment> {
     Ok((
-        safety_value(SafetyChannel::GpuTemp, &frame.gpu_temp_c)?,
-        safety_value(SafetyChannel::Power, &frame.power_w)?,
+        safety_value(SafetyChannel::GpuTemp, &frame.gpu_temp_c, frame.acquired_at)?,
+        safety_value(SafetyChannel::Power, &frame.power_w, frame.acquired_at)?,
     ))
 }
 
 fn sample_fault_rank(
     sample: &TelemetrySample<f32>,
     channel: SafetyChannel,
+    acquired_at: UnixMillis,
 ) -> Option<(u8, FrameAssessment)> {
-    sample_fault(channel, sample).map(|fault| (fault.rank(), fault.assessment(channel)))
+    sample_fault(channel, sample, acquired_at)
+        .map(|fault| (fault.rank(), fault.assessment(channel)))
 }
 
 fn worst_safety_fault(frame: &TelemetryFrame) -> Option<FrameAssessment> {
-    let temp = sample_fault_rank(&frame.gpu_temp_c, SafetyChannel::GpuTemp);
-    let power = sample_fault_rank(&frame.power_w, SafetyChannel::Power);
+    let temp = sample_fault_rank(&frame.gpu_temp_c, SafetyChannel::GpuTemp, frame.acquired_at);
+    let power = sample_fault_rank(&frame.power_w, SafetyChannel::Power, frame.acquired_at);
     match (temp, power) {
         (None, None) => None,
         (Some((_, a)), None) | (None, Some((_, a))) => Some(a),

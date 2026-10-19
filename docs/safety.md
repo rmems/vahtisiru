@@ -74,7 +74,9 @@ drive thresholds.
 
 Classification re-validates every safety sample that claims `Valid`. The value
 must be finite, inside the channel's own contract range (0–125 °C, 0–2000 W),
-and labelled as that channel. Otherwise it is `telemetry_invalid`, even when the
+labelled as that channel, and observed no later than the frame's
+`acquired_at` (zero tolerance, the same rule `TelemetrySample::from_raw`
+applies against `now`). Otherwise it is `telemetry_invalid`, even when the
 frame was built by hand or deserialized rather than produced by
 `TelemetrySample::from_raw`.
 
@@ -116,7 +118,8 @@ Free-text `last_reason` stays for logs only and is never a metric label.
 `SafetySnapshot::trip` is `Some(code)` only on the `evaluate` step that opens a
 fail-closed episode: a critical, missing, invalid or stale classification
 while no episode is open. The episode stays open until an evaluation finds the
-brake neither wanted nor engaged. So holding the brake, a warn-band re-apply
+brake not wanted, not engaged, and with no apply still in flight (an `Apply`
+intent not yet answered by `Applied` or `ApplyFailed`). So holding the brake, a warn-band re-apply
 right after a release, a warn frame while a release is in flight, recovery,
 and late actuator acks are not new trips. `record_actuator` never emits a trip,
 and adopting a leftover brake opens an episode without counting one. This

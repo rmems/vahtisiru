@@ -633,6 +633,58 @@ fn forged_signal_id_cannot_borrow_a_wider_range() {
     );
 }
 
+// ── Future-dated Valid samples (CodeAnt risk summary, PR #85) ───────
+
+const SKEWS_MS: [u64; 3] = [1, 1_000, 10_000_000_000];
+
+/// Healthy frame whose selected channels claim `Valid` but are observed
+/// `skew_ms` after the frame's own acquisition time.
+fn future_dated(temp: bool, power: bool, skew_ms: u64) -> TelemetryFrame {
+    let mut f = frame(60.0, 200.0);
+    let at = f.acquired_at + skew_ms;
+    for (on, sample) in [(temp, &mut f.gpu_temp_c), (power, &mut f.power_w)] {
+        if on {
+            sample.observed_at = at;
+            sample.validity = vahtisiru::telemetry::SampleValidity::Valid;
+        }
+    }
+    f
+}
+
+#[test]
+fn future_dated_valid_samples_fail_closed() {
+    for skew in SKEWS_MS {
+        for (temp, power, code) in [
+            (true, false, SafetyReason::TempInvalid),
+            (false, true, SafetyReason::PowerInvalid),
+            (true, true, SafetyReason::TempInvalid),
+        ] {
+            let snap = machine().evaluate(&future_dated(temp, power, skew));
+            assert_fail_closed_apply(&snap, SafetyState::TelemetryInvalid, code);
+        }
+    }
+    // Exactly at acquisition time is not in the future: still healthy.
+    let snap = machine().evaluate(&future_dated(true, true, 0));
+    assert_eq!(snap.state, SafetyState::HealthyReal);
+}
+
+#[test]
+fn deserialized_future_dated_valid_samples_fail_closed() {
+    for skew in SKEWS_MS {
+        for (key, code) in [
+            ("gpu_temp_c", SafetyReason::TempInvalid),
+            ("power_w", SafetyReason::PowerInvalid),
+        ] {
+            let base = frame(60.0, 200.0);
+            let mut json = serde_json::to_value(&base).unwrap();
+            json[key]["observed_at"] = (base.acquired_at + skew).into();
+            let f: TelemetryFrame = serde_json::from_value(json).unwrap();
+            let snap = machine().evaluate(&f);
+            assert_fail_closed_apply(&snap, SafetyState::TelemetryInvalid, code);
+        }
+    }
+}
+
 // ── Hysteresis ──────────────────────────────────────────────────────
 
 fn braked_machine() -> SafetyMachine {
@@ -808,6 +860,55 @@ fn warn_frame_while_release_in_flight_is_not_a_new_trip() {
     }
     let _ = m.record_actuator(ActuatorOutcome::Released);
     assert_eq!(m.evaluate(&ok).state, SafetyState::HealthyReal);
+    let again = m.evaluate(&frame(90.0, 200.0));
+    assert_eq!(
+        (again.trip, m.trips_total()),
+        (Some(SafetyReason::ThermalCritical), 2)
+    );
+}
+
+/// Blocks review (PR #85, thread 4311631864): a healthy frame while the apply
+/// is still in flight must not close the episode; the brake has not come off.
+#[test]
+fn healthy_frame_while_apply_in_flight_does_not_reopen_the_episode() {
+    let mut m = machine();
+    let steps = [
+        m.evaluate(&frame(90.0, 200.0)),
+        m.evaluate(&frame(60.0, 200.0)),
+        m.record_actuator(ActuatorOutcome::Applied),
+        m.evaluate(&frame(90.0, 200.0)),
+    ];
+    let trips: Vec<_> = steps.iter().map(|s| s.trip).collect();
+    assert_eq!(
+        (trips, m.trips_total()),
+        (
+            vec![Some(SafetyReason::ThermalCritical), None, None, None],
+            1
+        )
+    );
+    let decisions: Vec<_> = steps.iter().map(|s| (s.desired_brake, s.intent)).collect();
+    assert_eq!(
+        decisions,
+        vec![
+            (true, BrakeIntent::Apply),
+            (false, BrakeIntent::None),
+            (false, BrakeIntent::Release),
+            (true, BrakeIntent::None),
+        ]
+    );
+}
+
+/// A failed apply leaves nothing in flight: once readings are healthy the
+/// episode closes, and a later critical reading is a new trip.
+#[test]
+fn failed_apply_then_healthy_closes_the_episode() {
+    let mut m = machine();
+    let _ = m.evaluate(&frame(90.0, 200.0));
+    let _ = m.record_actuator(ActuatorOutcome::ApplyFailed("sudo denied".into()));
+    assert_eq!(
+        m.evaluate(&frame(60.0, 200.0)).state,
+        SafetyState::HealthyReal
+    );
     let again = m.evaluate(&frame(90.0, 200.0));
     assert_eq!(
         (again.trip, m.trips_total()),
