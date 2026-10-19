@@ -283,19 +283,14 @@ mod tests {
             record_safety_snapshot(&mut metrics, &snap);
         });
         let text = handle.render();
-        assert!(
-            text.contains("safety_trips_total{reason=\"thermal_critical\"} 1"),
-            "{text}"
-        );
-        assert!(
-            text.contains("safety_trips_total{reason=\"power_missing\"} 0"),
-            "{text}"
-        );
-        assert!(text.contains("safety_transitions_total 1"), "{text}");
-        assert!(
-            text.contains("safety_state{state=\"critical_braked\"} 1"),
-            "{text}"
-        );
+        let expected = [
+            "safety_trips_total{reason=\"thermal_critical\"} 1",
+            "safety_trips_total{reason=\"power_missing\"} 0",
+            "safety_transitions_total 1",
+            "safety_state{state=\"critical_braked\"} 1",
+        ];
+        let missing: Vec<_> = expected.iter().filter(|l| !text.contains(*l)).collect();
+        assert!(missing.is_empty(), "missing {missing:?} in:\n{text}");
         assert_eq!(
             text.matches("safety_trips_total{").count(),
             SafetyReason::ALL.len()

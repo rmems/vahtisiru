@@ -218,6 +218,69 @@ fn deterministic_path_is_identical_with_learned_component_absent_panicking_garba
     }
 }
 
+/// Remove `//` line comments (leading or trailing) and nested `/* */` block
+/// comments, keeping string and char literal contents. Enough of a lexer for
+/// the structural check; not a general Rust tokenizer (raw strings with `"#`
+/// delimiters are treated as ordinary strings).
+fn strip_comments(src: &str) -> String {
+    let b = src.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let (mut i, mut depth, mut in_str) = (0, 0usize, false);
+    while i < b.len() {
+        let next = b.get(i + 1).copied();
+        if depth > 0 {
+            match (b[i], next) {
+                (b'/', Some(b'*')) => (depth, i) = (depth + 1, i + 2),
+                (b'*', Some(b'/')) => (depth, i) = (depth - 1, i + 2),
+                _ => i += 1,
+            }
+        } else if in_str {
+            out.push(b[i]);
+            match b[i] {
+                b'\\' if next.is_some() => {
+                    out.push(b[i + 1]);
+                    i += 2;
+                }
+                b'"' => (in_str, i) = (false, i + 1),
+                _ => i += 1,
+            }
+        } else {
+            match (b[i], next) {
+                (b'/', Some(b'/')) => {
+                    while i < b.len() && b[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                (b'/', Some(b'*')) => (depth, i) = (1, i + 2),
+                (b'"', _) => {
+                    out.push(b'"');
+                    (in_str, i) = (true, i + 1);
+                }
+                (c, _) => {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+        }
+    }
+    String::from_utf8(out).expect("comment stripping preserves UTF-8")
+}
+
+#[test]
+fn strip_comments_removes_trailing_and_block_comments_only() {
+    let src = "let a = 1; // tokio\n/* corpus_ipc /* nested */ */ let b = \"//x\";\nuse tokio;";
+    let got = strip_comments(src);
+    assert!(
+        !got.contains("corpus_ipc") && !got.contains("nested"),
+        "{got}"
+    );
+    assert!(
+        got.contains("let b = \"//x\";") && got.contains("use tokio;"),
+        "{got}"
+    );
+    assert_eq!(got.matches("tokio").count(), 1, "{got}");
+}
+
 #[test]
 fn safety_module_has_no_dependency_on_learned_ipc_or_runtime_layers() {
     // Structural independence: the pure safety path must compile without
@@ -226,14 +289,7 @@ fn safety_module_has_no_dependency_on_learned_ipc_or_runtime_layers() {
         let src =
             std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path))
                 .unwrap();
-        let code: String = src
-            .lines()
-            .filter(|l| {
-                let t = l.trim_start();
-                !(t.starts_with("//") || t.starts_with("///") || t.starts_with("//!"))
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let code = strip_comments(&src);
         for forbidden in [
             "corpus_ipc",
             "crate::publish",
@@ -255,102 +311,51 @@ fn safety_module_has_no_dependency_on_learned_ipc_or_runtime_layers() {
 
 // ── Exact threshold boundaries ──────────────────────────────────────
 
+fn next_up(x: f32) -> f32 {
+    f32::from_bits(x.to_bits() + 1)
+}
+
+fn next_down(x: f32) -> f32 {
+    f32::from_bits(x.to_bits() - 1)
+}
+
+/// Healthy and warning never request the brake; every other state does.
+fn assert_classified(temp: f32, power: f32, state: SafetyState, code: SafetyReason) {
+    let snap = machine().evaluate(&frame(temp, power));
+    let should_brake = !matches!(state, SafetyState::HealthyReal | SafetyState::Warning);
+    assert_eq!(
+        (snap.state, snap.reason_code, snap.desired_brake),
+        (state, code, should_brake),
+        "temp={temp} power={power}"
+    );
+}
+
 #[test]
 fn thermal_and_power_boundaries_are_exact() {
+    use SafetyReason as R;
+    use SafetyState as S;
+    #[rustfmt::skip]
     let cases = [
-        // (temp, power, expected state, expected code)
-        (
-            f32::from_bits(TEMP_WARN.to_bits() - 1),
-            200.0,
-            SafetyState::HealthyReal,
-            SafetyReason::Healthy,
-        ),
-        (
-            TEMP_WARN,
-            200.0,
-            SafetyState::Warning,
-            SafetyReason::ThermalWarn,
-        ),
-        (
-            TEMP_CRIT,
-            200.0,
-            SafetyState::Warning,
-            SafetyReason::ThermalWarn,
-        ),
-        (
-            f32::from_bits(TEMP_CRIT.to_bits() + 1),
-            200.0,
-            SafetyState::CriticalBraked,
-            SafetyReason::ThermalCritical,
-        ),
-        (
-            60.0,
-            f32::from_bits(POWER_WARN.to_bits() - 1),
-            SafetyState::HealthyReal,
-            SafetyReason::Healthy,
-        ),
-        (
-            60.0,
-            POWER_WARN,
-            SafetyState::Warning,
-            SafetyReason::PowerWarn,
-        ),
-        (
-            60.0,
-            POWER_CRIT,
-            SafetyState::Warning,
-            SafetyReason::PowerWarn,
-        ),
-        (
-            60.0,
-            f32::from_bits(POWER_CRIT.to_bits() + 1),
-            SafetyState::CriticalBraked,
-            SafetyReason::PowerCritical,
-        ),
+        (next_down(TEMP_WARN), 200.0, S::HealthyReal, R::Healthy),
+        (TEMP_WARN, 200.0, S::Warning, R::ThermalWarn), // warn is inclusive
+        (TEMP_CRIT, 200.0, S::Warning, R::ThermalWarn), // critical is strict
+        (next_up(TEMP_CRIT), 200.0, S::CriticalBraked, R::ThermalCritical),
+        (60.0, next_down(POWER_WARN), S::HealthyReal, R::Healthy),
+        (60.0, POWER_WARN, S::Warning, R::PowerWarn),
+        (60.0, POWER_CRIT, S::Warning, R::PowerWarn),
+        (60.0, next_up(POWER_CRIT), S::CriticalBraked, R::PowerCritical),
         // Critical on one channel beats warn on the other.
-        (
-            TEMP_WARN,
-            POWER_CRIT + 1.0,
-            SafetyState::CriticalBraked,
-            SafetyReason::PowerCritical,
-        ),
+        (TEMP_WARN, POWER_CRIT + 1.0, S::CriticalBraked, R::PowerCritical),
         // Engineering-range edges: 0 °C / 0 W are valid readings, not missing.
-        (0.0, 0.0, SafetyState::HealthyReal, SafetyReason::Healthy),
-        // 125 °C is in range and critical; 125.x is invalid (fail closed).
-        (
-            125.0,
-            200.0,
-            SafetyState::CriticalBraked,
-            SafetyReason::ThermalCritical,
-        ),
-        (
-            125.1,
-            200.0,
-            SafetyState::TelemetryInvalid,
-            SafetyReason::TempInvalid,
-        ),
-        (
-            -0.1,
-            200.0,
-            SafetyState::TelemetryInvalid,
-            SafetyReason::TempInvalid,
-        ),
-        (
-            60.0,
-            2_000.1,
-            SafetyState::TelemetryInvalid,
-            SafetyReason::PowerInvalid,
-        ),
+        (0.0, 0.0, S::HealthyReal, R::Healthy),
+        // 125 °C is in range and critical; beyond the range is invalid.
+        (125.0, 200.0, S::CriticalBraked, R::ThermalCritical),
+        (125.1, 200.0, S::TelemetryInvalid, R::TempInvalid),
+        (-0.1, 200.0, S::TelemetryInvalid, R::TempInvalid),
+        (60.0, 2_000.1, S::TelemetryInvalid, R::PowerInvalid),
     ];
     for (temp, power, state, code) in cases {
-        let snap = machine().evaluate(&frame(temp, power));
-        assert_eq!(snap.state, state, "temp={temp} power={power}");
-        assert_eq!(snap.reason_code, code, "temp={temp} power={power}");
-        let should_brake = !matches!(state, SafetyState::HealthyReal | SafetyState::Warning);
-        assert_eq!(
-            snap.desired_brake, should_brake,
-            "temp={temp} power={power}"
-        );
+        assert_classified(temp, power, state, code);
     }
 }
 
@@ -362,13 +367,23 @@ fn non_finite_telemetry_fails_closed_and_never_passes_silently() {
             (raw(Some(60.0), Some(bad)), SafetyReason::PowerInvalid),
         ] {
             let snap = machine().evaluate(&assess(&r, fixtures::NOW));
-            assert_eq!(snap.state, SafetyState::TelemetryInvalid, "{bad}");
-            assert_eq!(snap.reason_code, code);
-            assert!(snap.desired_brake);
-            assert_eq!(snap.intent, BrakeIntent::Apply);
-            assert_eq!(snap.trip, Some(code));
+            assert_fail_closed_apply(&snap, SafetyState::TelemetryInvalid, code);
+            assert_eq!(snap.trip, Some(code), "{bad}");
         }
     }
+}
+
+/// Fail-closed snapshot: named state + code, brake desired, apply intent.
+fn assert_fail_closed_apply(snap: &SafetySnapshot, state: SafetyState, code: SafetyReason) {
+    assert_eq!(
+        (
+            snap.state,
+            snap.reason_code,
+            snap.desired_brake,
+            snap.intent
+        ),
+        (state, code, true, BrakeIntent::Apply)
+    );
 }
 
 // ── Stale / missing / future-dated telemetry ────────────────────────
@@ -379,9 +394,7 @@ fn contract_staleness_boundary_is_exact_and_fails_closed() {
     let fresh = machine().evaluate(&aged(60.0, 200.0, limit - 1));
     assert_eq!(fresh.state, SafetyState::HealthyReal);
     let stale = machine().evaluate(&aged(60.0, 200.0, limit));
-    assert_eq!(stale.state, SafetyState::TelemetryStale);
-    assert_eq!(stale.reason_code, SafetyReason::TempStale);
-    assert_eq!(stale.intent, BrakeIntent::Apply);
+    assert_fail_closed_apply(&stale, SafetyState::TelemetryStale, SafetyReason::TempStale);
 }
 
 #[test]
@@ -402,16 +415,21 @@ fn policy_staleness_boundary_is_exact_and_fails_closed() {
     let ok = SafetyMachine::with_policy(p.clone()).evaluate(&with_cadence(49));
     assert_eq!(ok.state, SafetyState::HealthyReal);
     let stale = SafetyMachine::with_policy(p.clone()).evaluate(&with_cadence(50));
-    assert_eq!(stale.state, SafetyState::TelemetryStale);
-    assert_eq!(stale.reason_code, SafetyReason::PolicyStale);
-    assert!(stale.desired_brake);
+    assert_fail_closed_apply(
+        &stale,
+        SafetyState::TelemetryStale,
+        SafetyReason::PolicyStale,
+    );
 
     // Declared acquisition interval one ms over the policy is also stale.
     let mut slow = with_cadence(0);
     slow.acquisition_cadence_ms = 51;
     let snap = SafetyMachine::with_policy(p).evaluate(&slow);
-    assert_eq!(snap.reason_code, SafetyReason::PolicyStale);
-    assert!(snap.desired_brake);
+    assert_fail_closed_apply(
+        &snap,
+        SafetyState::TelemetryStale,
+        SafetyReason::PolicyStale,
+    );
 }
 
 #[test]
@@ -441,17 +459,15 @@ fn missing_and_future_dated_samples_fail_closed_with_channel_specific_codes() {
             SafetyReason::TempInvalid,
         ),
     ] {
-        let snap = machine().evaluate(&assess(&r, fixtures::NOW));
-        assert_eq!(snap.state, state);
-        assert_eq!(snap.reason_code, code);
-        assert_eq!(snap.intent, BrakeIntent::Apply);
+        assert_fail_closed_apply(&machine().evaluate(&assess(&r, fixtures::NOW)), state, code);
     }
 
     // Unknown device envelope: real telemetry cannot be authorized healthy.
-    let snap = SafetyMachine::new().evaluate(&frame(40.0, 50.0));
-    assert_eq!(snap.state, SafetyState::TelemetryMissing);
-    assert_eq!(snap.reason_code, SafetyReason::PowerPolicyUnavailable);
-    assert!(snap.desired_brake);
+    assert_fail_closed_apply(
+        &SafetyMachine::new().evaluate(&frame(40.0, 50.0)),
+        SafetyState::TelemetryMissing,
+        SafetyReason::PowerPolicyUnavailable,
+    );
 }
 
 #[test]
@@ -542,10 +558,12 @@ fn every_trip_emits_exactly_one_rising_edge_event_with_reason_code() {
 
     // Held: no duplicate trip events while the brake is still desired,
     // including the actuator ack and different fail-closed reasons.
-    assert_eq!(m.record_actuator(ActuatorOutcome::Applied).trip, None);
-    assert_eq!(m.evaluate(&frame(60.0, POWER_CRIT + 5.0)).trip, None);
-    assert_eq!(m.evaluate(&aged(60.0, 200.0, 10_000)).trip, None);
-    assert_eq!(m.trips_total(), 1);
+    let held = [
+        m.record_actuator(ActuatorOutcome::Applied).trip,
+        m.evaluate(&frame(60.0, POWER_CRIT + 5.0)).trip,
+        m.evaluate(&aged(60.0, 200.0, 10_000)).trip,
+    ];
+    assert_eq!((held, m.trips_total()), ([None; 3], 1));
 
     // Recover and release.
     let ok = frame(60.0, 200.0);
@@ -553,9 +571,10 @@ fn every_trip_emits_exactly_one_rising_edge_event_with_reason_code() {
     let _ = m.evaluate(&ok);
     assert_eq!(m.evaluate(&ok).intent, BrakeIntent::Release);
     let released = m.record_actuator(ActuatorOutcome::Released);
-    assert_eq!(released.reason_code, SafetyReason::BrakeReleased);
-    assert_eq!(released.trip, None);
-    assert_eq!(m.evaluate(&ok).trip, None);
+    assert_eq!(
+        (released.reason_code, released.trip, m.evaluate(&ok).trip),
+        (SafetyReason::BrakeReleased, None, None)
+    );
 
     // Re-trip on a different cause emits a new event with that cause.
     let again = m.evaluate(&assess(&raw(Some(60.0), None), fixtures::NOW));
@@ -578,11 +597,16 @@ fn actuator_failure_is_observable_and_does_not_suppress_the_trip() {
     let trip = m.evaluate(&frame(90.0, 200.0));
     assert_eq!(trip.trip, Some(SafetyReason::ThermalCritical));
     let failed = m.record_actuator(ActuatorOutcome::ApplyFailed("sudo denied".into()));
-    assert_eq!(failed.state, SafetyState::ActuatorFailure);
-    assert_eq!(failed.reason_code, SafetyReason::ApplyFailed);
-    assert!(failed.actuator_failed);
-    assert_eq!(failed.intent, BrakeIntent::Apply, "must retry apply");
-    assert_eq!(m.actuator_failures_total(), 1);
+    // Apply must be retried; the failure is counted and named.
+    assert_fail_closed_apply(
+        &failed,
+        SafetyState::ActuatorFailure,
+        SafetyReason::ApplyFailed,
+    );
+    assert_eq!(
+        (failed.actuator_failed, m.actuator_failures_total()),
+        (true, 1)
+    );
     // Next evaluation still classifies and still wants the brake.
     let next = m.evaluate(&frame(90.0, 200.0));
     assert_eq!(next.policy_state, SafetyState::CriticalBraked);
@@ -612,8 +636,11 @@ impl SensoryPublisher for PanickingPublisher {
 fn panicking_publisher_cannot_unwind_through_safety_evaluation() {
     let mut m = machine();
     let (snap, res) = evaluate_then_try_publish(&mut m, &frame(90.0, 200.0), &PanickingPublisher);
-    assert_eq!(snap.state, SafetyState::CriticalBraked);
-    assert_eq!(snap.intent, BrakeIntent::Apply);
+    assert_fail_closed_apply(
+        &snap,
+        SafetyState::CriticalBraked,
+        SafetyReason::ThermalCritical,
+    );
     assert_eq!(snap.trip, Some(SafetyReason::ThermalCritical));
     assert_eq!(
         res,

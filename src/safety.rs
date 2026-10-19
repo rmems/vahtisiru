@@ -638,80 +638,78 @@ pub fn classify_frame_with_policy(
     if let Some(fault) = worst_safety_fault(frame) {
         return fault;
     }
-
     let (gpu_temp_c, power_w) = match safety_readings(frame) {
         Ok(v) => v,
-        Err(status) => {
-            let kind = kind_from_critical_status(&status);
-            let reason = status_reason(status);
-            let name = if reason.contains("power_w") {
-                "power_w"
-            } else {
-                "gpu_temp_c"
-            };
-            return FrameAssessment {
-                kind,
-                code: fault_code(name, kind),
-                reason,
-            };
-        }
+        Err(fault) => return fault,
     };
-
-    if frame.acquisition_cadence_ms > policy.config.max_acquisition_interval_ms
-        || [&frame.gpu_temp_c, &frame.power_w].iter().any(|sample| {
-            frame.acquired_at.saturating_sub(sample.observed_at) >= policy.config.max_sample_age_ms
-        })
-    {
+    if exceeds_freshness_policy(frame, policy) {
         return FrameAssessment {
             kind: AssessmentKind::Stale,
             code: SafetyReason::PolicyStale,
             reason: "sample age or acquisition interval exceeds safety policy".into(),
         };
     }
-    let Some((power_warn_w, power_critical_w)) = policy.power_limits_w else {
+    let Some(power_limits_w) = policy.power_limits_w else {
         return FrameAssessment {
             kind: AssessmentKind::Missing,
             code: SafetyReason::PowerPolicyUnavailable,
             reason: "power policy unavailable: provide device default or explicit limits".into(),
         };
     };
-    let temp_warn_c = policy.config.temp_warn_c;
-    let temp_critical_c = policy.config.temp_critical_c;
-    if gpu_temp_c > temp_critical_c {
-        return FrameAssessment {
-            kind: AssessmentKind::Critical,
-            code: SafetyReason::ThermalCritical,
-            reason: format!("GPU thermal: {gpu_temp_c:.0}°C exceeds {temp_critical_c:.0}°C"),
-        };
-    }
-    if power_w > power_critical_w {
-        return FrameAssessment {
-            kind: AssessmentKind::Critical,
-            code: SafetyReason::PowerCritical,
-            reason: format!("GPU power: {power_w:.0}W exceeds {power_critical_w:.0}W safety limit"),
-        };
-    }
-    if gpu_temp_c >= temp_warn_c {
-        return FrameAssessment {
-            kind: AssessmentKind::Warn,
-            code: SafetyReason::ThermalWarn,
-            reason: format!(
-                "GPU thermal: {gpu_temp_c:.0}°C approaching {temp_critical_c:.0}°C limit"
-            ),
-        };
-    }
-    if power_w >= power_warn_w {
-        return FrameAssessment {
-            kind: AssessmentKind::Warn,
-            code: SafetyReason::PowerWarn,
-            reason: format!("GPU power: {power_w:.0}W approaching safety limit"),
-        };
-    }
-    FrameAssessment {
-        kind: AssessmentKind::Ok,
-        code: SafetyReason::Healthy,
-        reason: "healthy real telemetry".to_string(),
-    }
+    classify_thresholds(gpu_temp_c, power_w, &policy.config, power_limits_w)
+}
+
+/// Sample age or declared acquisition interval exceeds the configured policy.
+fn exceeds_freshness_policy(frame: &TelemetryFrame, policy: &SafetyPolicy) -> bool {
+    frame.acquisition_cadence_ms > policy.config.max_acquisition_interval_ms
+        || [&frame.gpu_temp_c, &frame.power_w].iter().any(|sample| {
+            frame.acquired_at.saturating_sub(sample.observed_at) >= policy.config.max_sample_age_ms
+        })
+}
+
+/// Threshold classification of valid, fresh readings. Order is normative:
+/// thermal critical, power critical, thermal warn, power warn, healthy.
+/// Critical is exceeded strictly; warn is inclusive.
+fn classify_thresholds(
+    gpu_temp_c: f32,
+    power_w: f32,
+    config: &SafetyPolicyConfig,
+    (power_warn_w, power_critical_w): (f32, f32),
+) -> FrameAssessment {
+    let temp_warn_c = config.temp_warn_c;
+    let temp_critical_c = config.temp_critical_c;
+    let (kind, code, reason) = if gpu_temp_c > temp_critical_c {
+        (
+            AssessmentKind::Critical,
+            SafetyReason::ThermalCritical,
+            format!("GPU thermal: {gpu_temp_c:.0}°C exceeds {temp_critical_c:.0}°C"),
+        )
+    } else if power_w > power_critical_w {
+        (
+            AssessmentKind::Critical,
+            SafetyReason::PowerCritical,
+            format!("GPU power: {power_w:.0}W exceeds {power_critical_w:.0}W safety limit"),
+        )
+    } else if gpu_temp_c >= temp_warn_c {
+        (
+            AssessmentKind::Warn,
+            SafetyReason::ThermalWarn,
+            format!("GPU thermal: {gpu_temp_c:.0}°C approaching {temp_critical_c:.0}°C limit"),
+        )
+    } else if power_w >= power_warn_w {
+        (
+            AssessmentKind::Warn,
+            SafetyReason::PowerWarn,
+            format!("GPU power: {power_w:.0}W approaching safety limit"),
+        )
+    } else {
+        (
+            AssessmentKind::Ok,
+            SafetyReason::Healthy,
+            "healthy real telemetry".to_string(),
+        )
+    };
+    FrameAssessment { kind, code, reason }
 }
 
 /// Direct warn-path helper: missing/invalid/stale fail closed as Critical.
@@ -735,92 +733,116 @@ fn warn_from_frame(frame: &TelemetryFrame) -> Option<SafetyStatus> {
     }
 }
 
-fn kind_from_critical_status(status: &SafetyStatus) -> AssessmentKind {
-    match status {
-        SafetyStatus::Critical(msg) if msg.contains("missing") => AssessmentKind::Missing,
-        SafetyStatus::Critical(msg) if msg.contains("invalid") => AssessmentKind::Invalid,
-        SafetyStatus::Critical(msg) if msg.contains("stale") => AssessmentKind::Stale,
-        SafetyStatus::Critical(_) => AssessmentKind::Critical,
-        SafetyStatus::Warn(_) => AssessmentKind::Warn,
-        SafetyStatus::Ok => AssessmentKind::Ok,
-    }
+/// Safety-critical telemetry channel. Typed so reason codes never depend on
+/// message wording (GH#42 review).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SafetyChannel {
+    GpuTemp,
+    Power,
 }
 
-fn fault_code(name: &str, kind: AssessmentKind) -> SafetyReason {
-    let power = name == "power_w";
-    match (kind, power) {
-        (AssessmentKind::Missing, false) => SafetyReason::TempMissing,
-        (AssessmentKind::Missing, true) => SafetyReason::PowerMissing,
-        (AssessmentKind::Invalid, false) => SafetyReason::TempInvalid,
-        (AssessmentKind::Invalid, true) => SafetyReason::PowerInvalid,
-        (AssessmentKind::Stale, false) => SafetyReason::TempStale,
-        (AssessmentKind::Stale, true) => SafetyReason::PowerStale,
-        (AssessmentKind::Critical, false) => SafetyReason::ThermalCritical,
-        (AssessmentKind::Critical, true) => SafetyReason::PowerCritical,
-        (AssessmentKind::Warn, false) => SafetyReason::ThermalWarn,
-        (AssessmentKind::Warn, true) => SafetyReason::PowerWarn,
-        (AssessmentKind::Ok, _) => SafetyReason::Healthy,
-        (AssessmentKind::Simulated, _) => SafetyReason::Simulated,
-    }
-}
-
-fn status_reason(status: SafetyStatus) -> String {
-    match status {
-        SafetyStatus::Ok => "ok".to_string(),
-        SafetyStatus::Warn(msg) | SafetyStatus::Critical(msg) => msg,
-    }
-}
-
-fn safety_value(name: &str, sample: &TelemetrySample<f32>) -> Result<f32, SafetyStatus> {
-    match sample.validity {
-        SampleValidity::Missing => Err(SafetyStatus::Critical(format!(
-            "Invalid telemetry: {name} missing"
-        ))),
-        SampleValidity::Invalid => Err(SafetyStatus::Critical(format!(
-            "Invalid telemetry: {name} invalid"
-        ))),
-        SampleValidity::Stale => Err(SafetyStatus::Critical(format!(
-            "Invalid telemetry: {name} stale"
-        ))),
-        SampleValidity::Valid => sample
-            .value
-            .ok_or_else(|| SafetyStatus::Critical(format!("Invalid telemetry: {name} missing"))),
-    }
-}
-
-fn safety_readings(frame: &TelemetryFrame) -> Result<(f32, f32), SafetyStatus> {
-    Ok((
-        safety_value("gpu_temp_c", &frame.gpu_temp_c)?,
-        safety_value("power_w", &frame.power_w)?,
-    ))
-}
-
-fn sample_fault_rank(sample: &TelemetrySample<f32>, name: &str) -> Option<(u8, FrameAssessment)> {
-    let (rank, kind, label) = match sample.validity {
-        SampleValidity::Valid => {
-            if sample.value.is_none() {
-                (3, AssessmentKind::Missing, "missing")
-            } else {
-                return None;
-            }
+impl SafetyChannel {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::GpuTemp => "gpu_temp_c",
+            Self::Power => "power_w",
         }
-        SampleValidity::Stale => (1, AssessmentKind::Stale, "stale"),
-        SampleValidity::Invalid => (2, AssessmentKind::Invalid, "invalid"),
-        SampleValidity::Missing => (3, AssessmentKind::Missing, "missing"),
-    };
-    Some((
-        rank,
+    }
+}
+
+/// Typed sample fault: which channel, and whether it is missing/invalid/stale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SampleFault {
+    Missing,
+    Invalid,
+    Stale,
+}
+
+impl SampleFault {
+    /// Worst-fault ranking: missing > invalid > stale.
+    const fn rank(self) -> u8 {
+        match self {
+            Self::Missing => 3,
+            Self::Invalid => 2,
+            Self::Stale => 1,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Invalid => "invalid",
+            Self::Stale => "stale",
+        }
+    }
+
+    const fn kind(self) -> AssessmentKind {
+        match self {
+            Self::Missing => AssessmentKind::Missing,
+            Self::Invalid => AssessmentKind::Invalid,
+            Self::Stale => AssessmentKind::Stale,
+        }
+    }
+
+    /// Reason code from the typed (channel, fault) pair, never from text.
+    const fn code(self, channel: SafetyChannel) -> SafetyReason {
+        match (self, channel) {
+            (Self::Missing, SafetyChannel::GpuTemp) => SafetyReason::TempMissing,
+            (Self::Missing, SafetyChannel::Power) => SafetyReason::PowerMissing,
+            (Self::Invalid, SafetyChannel::GpuTemp) => SafetyReason::TempInvalid,
+            (Self::Invalid, SafetyChannel::Power) => SafetyReason::PowerInvalid,
+            (Self::Stale, SafetyChannel::GpuTemp) => SafetyReason::TempStale,
+            (Self::Stale, SafetyChannel::Power) => SafetyReason::PowerStale,
+        }
+    }
+
+    fn assessment(self, channel: SafetyChannel) -> FrameAssessment {
         FrameAssessment {
-            kind,
-            code: fault_code(name, kind),
-            reason: format!("Invalid telemetry: {name} {label}"),
-        },
+            kind: self.kind(),
+            code: self.code(channel),
+            reason: format!("Invalid telemetry: {} {}", channel.name(), self.label()),
+        }
+    }
+}
+
+/// Typed fault for one safety sample, or `None` when it is valid with a value.
+fn sample_fault(sample: &TelemetrySample<f32>) -> Option<SampleFault> {
+    match sample.validity {
+        SampleValidity::Valid if sample.value.is_some() => None,
+        SampleValidity::Valid | SampleValidity::Missing => Some(SampleFault::Missing),
+        SampleValidity::Invalid => Some(SampleFault::Invalid),
+        SampleValidity::Stale => Some(SampleFault::Stale),
+    }
+}
+
+fn safety_value(
+    channel: SafetyChannel,
+    sample: &TelemetrySample<f32>,
+) -> Result<f32, FrameAssessment> {
+    match (sample_fault(sample), sample.value) {
+        (None, Some(v)) => Ok(v),
+        (Some(fault), _) => Err(fault.assessment(channel)),
+        (None, None) => Err(SampleFault::Missing.assessment(channel)),
+    }
+}
+
+fn safety_readings(frame: &TelemetryFrame) -> Result<(f32, f32), FrameAssessment> {
+    Ok((
+        safety_value(SafetyChannel::GpuTemp, &frame.gpu_temp_c)?,
+        safety_value(SafetyChannel::Power, &frame.power_w)?,
     ))
+}
+
+fn sample_fault_rank(
+    sample: &TelemetrySample<f32>,
+    channel: SafetyChannel,
+) -> Option<(u8, FrameAssessment)> {
+    sample_fault(sample).map(|fault| (fault.rank(), fault.assessment(channel)))
 }
 
 fn worst_safety_fault(frame: &TelemetryFrame) -> Option<FrameAssessment> {
-    let temp = sample_fault_rank(&frame.gpu_temp_c, "gpu_temp_c");
-    let power = sample_fault_rank(&frame.power_w, "power_w");
+    let temp = sample_fault_rank(&frame.gpu_temp_c, SafetyChannel::GpuTemp);
+    let power = sample_fault_rank(&frame.power_w, SafetyChannel::Power);
     match (temp, power) {
         (None, None) => None,
         (Some((_, a)), None) | (None, Some((_, a))) => Some(a),
@@ -1612,6 +1634,76 @@ mod tests {
         let assessment = classify_frame_with_policy_test(&frame);
         assert_eq!(assessment.kind, AssessmentKind::Missing);
         assert!(assessment.reason.contains("power_w"));
+    }
+
+    /// Reason codes come from typed (channel, fault) data. This pins both the
+    /// code and the exact log wording for every safety channel and fault, so
+    /// rewording a message can neither silently change a code nor go unseen.
+    #[test]
+    fn fault_reason_codes_are_typed_not_derived_from_message_text() {
+        let cases = [
+            (
+                SampleValidity::Missing,
+                true,
+                "missing",
+                SafetyReason::TempMissing,
+                SafetyReason::PowerMissing,
+            ),
+            (
+                SampleValidity::Valid,
+                false,
+                "missing",
+                SafetyReason::TempMissing,
+                SafetyReason::PowerMissing,
+            ),
+            (
+                SampleValidity::Invalid,
+                true,
+                "invalid",
+                SafetyReason::TempInvalid,
+                SafetyReason::PowerInvalid,
+            ),
+            (
+                SampleValidity::Stale,
+                true,
+                "stale",
+                SafetyReason::TempStale,
+                SafetyReason::PowerStale,
+            ),
+        ];
+        for (validity, has_value, label, temp_code, power_code) in cases {
+            for (power, code, name) in [
+                (false, temp_code, "gpu_temp_c"),
+                (true, power_code, "power_w"),
+            ] {
+                let mut frame = nvml_temp_power(60.0, 200.0);
+                let sample = if power {
+                    &mut frame.power_w
+                } else {
+                    &mut frame.gpu_temp_c
+                };
+                sample.validity = validity;
+                if !has_value {
+                    sample.value = None;
+                }
+                let a = classify_frame_with_policy_test(&frame);
+                assert_eq!(a.code, code, "{name} {validity:?}");
+                assert_eq!(a.reason, format!("Invalid telemetry: {name} {label}"));
+            }
+        }
+        // The typed mapping is independent of any message: the code for a
+        // fault on the power channel never mentions temperature.
+        for fault in [
+            SampleFault::Missing,
+            SampleFault::Invalid,
+            SampleFault::Stale,
+        ] {
+            assert_ne!(
+                fault.code(SafetyChannel::Power),
+                fault.code(SafetyChannel::GpuTemp)
+            );
+            assert_eq!(fault.assessment(SafetyChannel::Power).kind, fault.kind());
+        }
     }
 
     #[test]

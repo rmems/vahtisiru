@@ -855,7 +855,8 @@ fn store_safety(
     cpu::record_safety_snapshot(&mut metrics, snap);
 }
 
-fn log_safety_snapshot(snap: &SafetySnapshot, warned_brake_held_sim: &mut bool) {
+/// Structured trip line; emitted once per deterministic trip (rising edge).
+fn log_safety_trip(snap: &SafetySnapshot) {
     if let Some(code) = snap.trip {
         eprintln!(
             "[relay] SAFETY TRIP reason={} state={} ({})",
@@ -864,6 +865,10 @@ fn log_safety_snapshot(snap: &SafetySnapshot, warned_brake_held_sim: &mut bool) 
             snap.last_reason
         );
     }
+}
+
+fn log_safety_snapshot(snap: &SafetySnapshot, warned_brake_held_sim: &mut bool) {
+    log_safety_trip(snap);
     if let Some((from, to)) = snap.transition {
         eprintln!(
             "[relay] safety {} → {} ({})",
