@@ -939,15 +939,7 @@ mod tests {
             .await;
         assert_eq!(
             (plan.actuation, sup.snapshot().brake_engaged, hw(&fake)),
-            (
-                ShutdownActuation::AwaitApply,
-                true,
-                Hw {
-                    engaged: true,
-                    applies: 1,
-                    releases: 0
-                }
-            )
+            (ShutdownActuation::AwaitApply, true, hw_is(true, 1, 0))
         );
     }
 
@@ -1226,6 +1218,9 @@ mod tests {
         ActuatorError::CommandFailed(SUDO_DENIED.into()).to_string()
     }
 
+    // Short names keep each expected observation on one readable line.
+    use crate::safety::{BrakeIntent as I, SafetyState as S};
+
     // ---- comparable observations ----
     //
     // Each check compares a whole observation as one value. Any field that
@@ -1244,6 +1239,15 @@ mod tests {
             engaged: fake.is_engaged(),
             applies: fake.apply_calls(),
             releases: fake.release_calls(),
+        }
+    }
+
+    /// Expected double state: claim, apply count, release count.
+    const fn hw_is(engaged: bool, applies: u32, releases: u32) -> Hw {
+        Hw {
+            engaged,
+            applies,
+            releases,
         }
     }
 
@@ -1301,12 +1305,20 @@ mod tests {
         }
     }
 
+    /// Fail-closed tick: the read found NVML unavailable or the gate busy.
+    fn unavailable(state: SafetyState, intent: BrakeIntent, brake_engaged: bool) -> Tick {
+        Tick {
+            source: TelemetrySource::NvmlUnavailable,
+            ..quiet(state, intent, brake_engaged)
+        }
+    }
+
     /// Real-telemetry tick that spawned a worker for its intent.
     fn dispatching(state: SafetyState, intent: BrakeIntent, brake_engaged: bool) -> Tick {
         let in_flight = match intent {
-            BrakeIntent::Apply => InFlightActuation::Apply,
-            BrakeIntent::Release => InFlightActuation::Release,
-            BrakeIntent::None => InFlightActuation::None,
+            I::Apply => InFlightActuation::Apply,
+            I::Release => InFlightActuation::Release,
+            I::None => InFlightActuation::None,
         };
         Tick {
             in_flight,
@@ -1335,9 +1347,8 @@ mod tests {
     #[tokio::test]
     async fn hung_acquire_fail_closes_in_bounded_time_and_defers_brake_until_gate_frees() {
         let fake = Arc::new(FakeActuator::new());
-        // Hold the eventual apply in flight until the test releases it, so the
-        // tick that dispatches it is deterministic (the bare fake returns
-        // instantly and can race this tick's own read for the freed gate).
+        // Hold the eventual apply in flight so its dispatch tick is
+        // deterministic; the bare fake can race that tick's own read.
         let controlled = Arc::new(ControlledActuator::new(fake.clone()));
         let (release_apply, apply_entered) = controlled.block_next_apply();
         let acquirer = Arc::new(ScriptedAcquirer::new([fixtures::healthy_real()]));
@@ -1347,9 +1358,8 @@ mod tests {
             .acquirer(acquirer.clone())
             .build();
         let parked = Tick {
-            source: TelemetrySource::NvmlUnavailable,
-            pending: Some(BrakeIntent::Apply),
-            ..quiet(SafetyState::TelemetryMissing, BrakeIntent::Apply, false)
+            pending: Some(I::Apply),
+            ..unavailable(S::TelemetryMissing, I::Apply, false)
         };
 
         let started = Instant::now();
@@ -1360,14 +1370,7 @@ mod tests {
         // No actuation attempt and no invented actuator failure.
         assert_eq!(
             (hw(&fake), sup.machine().actuator_failures_total()),
-            (
-                Hw {
-                    engaged: false,
-                    applies: 0,
-                    releases: 0
-                },
-                0
-            )
+            (hw_is(false, 0, 0), 0)
         );
 
         // Still hung: every tick stays fail-closed and parks the intent; the
@@ -1375,11 +1378,7 @@ mod tests {
         for _ in 0..3 {
             assert_eq!(tick(&sup.step().await), parked);
         }
-        assert_eq!(
-            acquirer.calls(),
-            1,
-            "no new worker while the first is wedged"
-        );
+        assert_eq!(acquirer.calls(), 1, "no second read worker");
 
         // Driver returns: the parked brake takes the freed gate before this
         // tick's own read, which then finds the gate held by the apply and
@@ -1390,16 +1389,11 @@ mod tests {
         let report = sup.step().await;
         apply_entered.recv_timeout(Duration::from_secs(1)).unwrap();
         let claimed = Tick {
-            source: TelemetrySource::NvmlUnavailable,
             in_flight: InFlightActuation::Apply,
             dispatched: true,
-            ..quiet(SafetyState::TelemetryMissing, BrakeIntent::Apply, false)
+            ..unavailable(S::TelemetryMissing, I::Apply, false)
         };
-        assert_eq!(
-            tick(&report),
-            claimed,
-            "parked brake claims the freed gate first"
-        );
+        assert_eq!(tick(&report), claimed, "brake claims gate first");
 
         // The post-apply re-read reached the recovered driver (healthy frame),
         // so the machine is Recovering rather than still fail-closed.
@@ -1409,17 +1403,8 @@ mod tests {
         assert_eq!(
             (tick(&report), hw(&fake)),
             (
-                joined(
-                    Outcome::Applied,
-                    SafetyState::Recovering,
-                    BrakeIntent::None,
-                    true
-                ),
-                Hw {
-                    engaged: true,
-                    applies: 1,
-                    releases: 0
-                }
+                joined(Outcome::Applied, S::Recovering, I::None, true),
+                hw_is(true, 1, 0)
             )
         );
     }
@@ -1439,7 +1424,7 @@ mod tests {
         let report = sup.step().await;
         assert_eq!(
             tick(&report),
-            dispatching(SafetyState::CriticalBraked, BrakeIntent::Apply, false)
+            dispatching(S::CriticalBraked, I::Apply, false)
         );
         settle(&sup).await;
 
@@ -1447,12 +1432,7 @@ mod tests {
         let report = step_until(&mut sup, 5, |r| r.actuation.is_some()).await;
         assert_eq!(
             tick(&report),
-            joined(
-                Outcome::ApplyFailed,
-                SafetyState::ActuatorFailure,
-                BrakeIntent::Apply,
-                false
-            )
+            joined(Outcome::ApplyFailed, S::ActuatorFailure, I::Apply, false)
         );
         assert_eq!(
             (report.actuation, report.snapshot.last_actuator_error),
@@ -1464,15 +1444,7 @@ mod tests {
         let exported = sup.relay_metrics.lock().unwrap().safety_state;
         assert_eq!(
             (hw(&fake), sup.machine().actuator_failures_total(), exported),
-            (
-                Hw {
-                    engaged: false,
-                    applies: 1,
-                    releases: 0
-                },
-                1,
-                SafetyState::ActuatorFailure
-            )
+            (hw_is(false, 1, 0), 1, S::ActuatorFailure)
         );
 
         // Retried at the 10-tick cadence, and still denied.
@@ -1482,14 +1454,7 @@ mod tests {
         let report = step_until(&mut sup, 5, |r| r.actuation.is_some()).await;
         assert_eq!(
             (report.snapshot.state, hw(&fake)),
-            (
-                SafetyState::ActuatorFailure,
-                Hw {
-                    engaged: false,
-                    applies: 2,
-                    releases: 0
-                }
-            )
+            (S::ActuatorFailure, hw_is(false, 2, 0))
         );
 
         // Operator fixes sudoers: the next retry engages the brake and the
@@ -1501,17 +1466,8 @@ mod tests {
         assert_eq!(
             (tick(&report), hw(&fake)),
             (
-                joined(
-                    Outcome::Applied,
-                    SafetyState::CriticalBraked,
-                    BrakeIntent::None,
-                    true
-                ),
-                Hw {
-                    engaged: true,
-                    applies: 3,
-                    releases: 0
-                }
+                joined(Outcome::Applied, S::CriticalBraked, I::None, true),
+                hw_is(true, 3, 0)
             )
         );
     }
@@ -1530,19 +1486,13 @@ mod tests {
             .build();
         sup.seed_startup_brake(Some(200), Some(400));
         let seeded = sup.snapshot();
-        assert_eq!(
-            (seeded.brake_engaged, seeded.state),
-            (true, SafetyState::Recovering)
-        );
+        assert_eq!((seeded.brake_engaged, seeded.state), (true, S::Recovering));
 
         // Evaluations happen at steps 1, 10, 20 → streak of 3 → Release.
         let report = step_until(&mut sup, 25, |r| r.dispatched).await;
         assert_eq!(
             (report.step, tick(&report)),
-            (
-                20,
-                dispatching(SafetyState::Recovering, BrakeIntent::Release, true)
-            )
+            (20, dispatching(S::Recovering, I::Release, true))
         );
         settle(&sup).await;
 
@@ -1552,17 +1502,8 @@ mod tests {
         assert_eq!(
             (tick(&report), hw(&fake)),
             (
-                joined(
-                    Outcome::ReleaseFailed,
-                    SafetyState::ActuatorFailure,
-                    BrakeIntent::Release,
-                    true
-                ),
-                Hw {
-                    engaged: true,
-                    applies: 1,
-                    releases: 1
-                }
+                joined(Outcome::ReleaseFailed, S::ActuatorFailure, I::Release, true),
+                hw_is(true, 1, 1)
             )
         );
 
@@ -1573,17 +1514,8 @@ mod tests {
         assert_eq!(
             (tick(&report), hw(&fake)),
             (
-                joined(
-                    Outcome::Released,
-                    SafetyState::HealthyReal,
-                    BrakeIntent::None,
-                    false
-                ),
-                Hw {
-                    engaged: false,
-                    applies: 1,
-                    releases: 2
-                }
+                joined(Outcome::Released, S::HealthyReal, I::None, false),
+                hw_is(false, 1, 2)
             )
         );
     }
@@ -1604,16 +1536,15 @@ mod tests {
         let report = sup.step().await;
         assert_eq!(
             tick(&report),
-            dispatching(SafetyState::CriticalBraked, BrakeIntent::Apply, false)
+            dispatching(S::CriticalBraked, I::Apply, false)
         );
         apply_entered.recv_timeout(Duration::from_secs(1)).unwrap();
 
         // The apply worker holds the gate: ticks fail closed to NvmlUnavailable
         // and evaluate every tick, but never spawn a second worker.
         let blocked = Tick {
-            source: TelemetrySource::NvmlUnavailable,
             in_flight: InFlightActuation::Apply,
-            ..quiet(SafetyState::TelemetryMissing, BrakeIntent::Apply, false)
+            ..unavailable(S::TelemetryMissing, I::Apply, false)
         };
         for _ in 0..12 {
             let report = sup.step().await;
@@ -1623,14 +1554,7 @@ mod tests {
                 "release must not overlap apply"
             );
         }
-        assert_eq!(
-            hw(&fake),
-            Hw {
-                engaged: false,
-                applies: 0,
-                releases: 0
-            }
-        );
+        assert_eq!(hw(&fake), hw_is(false, 0, 0));
 
         // Post-apply reassessment saw healthy real telemetry: Recovering, no
         // release yet (hysteresis), and nothing dispatched this tick.
@@ -1640,42 +1564,21 @@ mod tests {
         assert_eq!(
             (tick(&report), hw(&fake)),
             (
-                joined(
-                    Outcome::Applied,
-                    SafetyState::Recovering,
-                    BrakeIntent::None,
-                    true
-                ),
-                Hw {
-                    engaged: true,
-                    applies: 1,
-                    releases: 0
-                }
+                joined(Outcome::Applied, S::Recovering, I::None, true),
+                hw_is(true, 1, 0)
             )
         );
 
         // Ok streak completes on cadence; exactly one release follows.
         let report = step_until(&mut sup, 40, |r| r.in_flight == InFlightActuation::Release).await;
-        assert_eq!(
-            tick(&report),
-            dispatching(SafetyState::Recovering, BrakeIntent::Release, true)
-        );
+        assert_eq!(tick(&report), dispatching(S::Recovering, I::Release, true));
         settle(&sup).await;
         let report = step_until(&mut sup, 5, |r| !r.snapshot.brake_engaged).await;
         assert_eq!(
             (tick(&report), hw(&fake)),
             (
-                joined(
-                    Outcome::Released,
-                    SafetyState::HealthyReal,
-                    BrakeIntent::None,
-                    false
-                ),
-                Hw {
-                    engaged: false,
-                    applies: 1,
-                    releases: 1
-                }
+                joined(Outcome::Released, S::HealthyReal, I::None, false),
+                hw_is(false, 1, 1)
             )
         );
     }
@@ -1695,18 +1598,13 @@ mod tests {
         let report = sup.step().await;
         assert_eq!(
             tick(&report),
-            dispatching(SafetyState::CriticalBraked, BrakeIntent::Apply, false)
+            dispatching(S::CriticalBraked, I::Apply, false)
         );
         settle(&sup).await;
         let report = step_until(&mut sup, 5, |r| r.actuation.is_some()).await;
         assert_eq!(
             tick(&report),
-            joined(
-                Outcome::ApplyFailed,
-                SafetyState::ActuatorFailure,
-                BrakeIntent::Apply,
-                false
-            )
+            joined(Outcome::ApplyFailed, S::ActuatorFailure, I::Apply, false)
         );
         // Counted once, the fake was never reached, and the gate permit was
         // dropped with the panicking worker.
@@ -1716,15 +1614,7 @@ mod tests {
                 hw(&fake),
                 sup.gate.try_enter().is_ok()
             ),
-            (
-                1,
-                Hw {
-                    engaged: false,
-                    applies: 0,
-                    releases: 0
-                },
-                true
-            )
+            (1, hw_is(false, 0, 0), true)
         );
     }
 
@@ -1747,7 +1637,7 @@ mod tests {
             .build();
 
         let started = Instant::now();
-        let healthy = quiet(SafetyState::HealthyReal, BrakeIntent::None, false);
+        let healthy = quiet(S::HealthyReal, I::None, false);
         for _ in 0..30 {
             assert_eq!(tick(&sup.step().await), healthy);
         }
@@ -1771,24 +1661,15 @@ mod tests {
         let report = step_until(&mut sup, 12, |r| r.dispatched).await;
         assert_eq!(
             tick(&report),
-            dispatching(SafetyState::CriticalBraked, BrakeIntent::Apply, false)
+            dispatching(S::CriticalBraked, I::Apply, false)
         );
         settle(&sup).await;
         let report = step_until(&mut sup, 5, |r| r.snapshot.brake_engaged).await;
         assert_eq!(
             (tick(&report), hw(&fake)),
             (
-                joined(
-                    Outcome::Applied,
-                    SafetyState::CriticalBraked,
-                    BrakeIntent::None,
-                    true
-                ),
-                Hw {
-                    engaged: true,
-                    applies: 1,
-                    releases: 0
-                }
+                joined(Outcome::Applied, S::CriticalBraked, I::None, true),
+                hw_is(true, 1, 0)
             )
         );
     }
@@ -1805,7 +1686,7 @@ mod tests {
 
         let held = Tick {
             source: TelemetrySource::SoftwareFallback,
-            ..quiet(SafetyState::SimulatedSoftwareOnly, BrakeIntent::None, true)
+            ..quiet(S::SimulatedSoftwareOnly, I::None, true)
         };
         for _ in 0..45 {
             assert_eq!(tick(&sup.step().await), held);
@@ -1813,15 +1694,7 @@ mod tests {
         let exported_brake = sup.relay_metrics.lock().unwrap().brake_engaged;
         assert_eq!(
             (hw(&fake), sup.warned_brake_held_sim, exported_brake),
-            (
-                Hw {
-                    engaged: true,
-                    applies: 1,
-                    releases: 0
-                },
-                true,
-                true
-            ),
+            (hw_is(true, 1, 0), true, true),
             "brake held on hardware, operator warned, metrics report it"
         );
     }
@@ -1840,7 +1713,7 @@ mod tests {
         let report = sup.step().await;
         assert_eq!(
             tick(&report),
-            dispatching(SafetyState::CriticalBraked, BrakeIntent::Apply, false)
+            dispatching(S::CriticalBraked, I::Apply, false)
         );
         settle(&sup).await;
         let (release, _entered) = acquirer.hang_until_released();
@@ -1850,24 +1723,11 @@ mod tests {
         let bounded = started.elapsed() < Duration::from_secs(1);
         let reread_fail_closed = Tick {
             source: TelemetrySource::NvmlUnavailable,
-            ..joined(
-                Outcome::Applied,
-                SafetyState::TelemetryMissing,
-                BrakeIntent::None,
-                true,
-            )
+            ..joined(Outcome::Applied, S::TelemetryMissing, I::None, true)
         };
         assert_eq!(
             (bounded, tick(&report), hw(&fake)),
-            (
-                true,
-                reread_fail_closed,
-                Hw {
-                    engaged: true,
-                    applies: 1,
-                    releases: 0
-                }
-            )
+            (true, reread_fail_closed, hw_is(true, 1, 0))
         );
         acquirer.unhang();
         release.send(()).unwrap();
@@ -1886,10 +1746,7 @@ mod tests {
             .build();
         sup.seed_startup_brake(Some(200), Some(400));
         let report = step_until(&mut sup, 25, |r| r.in_flight == InFlightActuation::Release).await;
-        assert_eq!(
-            tick(&report),
-            dispatching(SafetyState::Recovering, BrakeIntent::Release, true)
-        );
+        assert_eq!(tick(&report), dispatching(S::Recovering, I::Release, true));
 
         let (tx, metrics_task) = metrics_collector(&sup.relay_metrics);
         let plan = sup
@@ -1905,12 +1762,8 @@ mod tests {
             (
                 ShutdownActuation::AwaitAuthorizedRelease,
                 true,
-                SafetyState::ActuatorFailure,
-                Hw {
-                    engaged: true,
-                    applies: 1,
-                    releases: 1
-                }
+                S::ActuatorFailure,
+                hw_is(true, 1, 1)
             )
         );
         assert_eq!((reason, exported_brake), (Some("sigint"), true));
