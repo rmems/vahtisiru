@@ -210,25 +210,15 @@ impl Supervisor {
 
         // Reconcile workers that finished during the sleep. A success already
         // re-read and re-evaluated telemetry; a failure is recorded as-is.
+        // At most one worker is ever in flight, so at most one slot settles.
         let mut actuation = None;
-        let mut succeeded = false;
-        let mut failed = false;
         for kind in [ActuationKind::Apply, ActuationKind::Release] {
-            if let Some(outcome) = self.reconcile_finished(kind).await {
-                if outcome_succeeded(&outcome) {
-                    succeeded = true;
-                } else {
-                    failed = true;
-                }
-                actuation = Some(outcome);
-            }
+            actuation = self.reconcile_finished(kind).await.or(actuation);
         }
+        let succeeded = actuation.as_ref().is_some_and(outcome_succeeded);
+        let failed = actuation.is_some() && !succeeded;
 
-        let dispatch_due = if succeeded {
-            true
-        } else {
-            self.evaluate_or_publish(step_count, &telemetry, failed)
-        };
+        let dispatch_due = succeeded || self.evaluate_or_publish(step_count, &telemetry, failed);
         dispatched |= self.dispatch_due_or_pending(dispatch_due);
 
         {
@@ -407,20 +397,25 @@ impl Supervisor {
             ShutdownActuation::AwaitAuthorizedRelease => Some(ActuationKind::Release),
         };
         for kind in [ActuationKind::Apply, ActuationKind::Release] {
-            let slot = match kind {
-                ActuationKind::Apply => &mut self.brake_task,
-                ActuationKind::Release => &mut self.release_task,
-            };
-            let Some(task) = slot.take() else { continue };
-            if awaited == Some(kind) {
-                self.await_in_flight(kind, task).await;
-            } else {
-                task.abort();
-            }
+            self.settle_slot(kind, awaited == Some(kind)).await;
         }
 
         shutdown_metrics_collector(metrics_shutdown, metrics_task, SHUTDOWN_METRICS_TIMEOUT).await;
         plan
+    }
+
+    /// Empty one worker slot on shutdown: join it (bounded) when authorized,
+    /// otherwise abort it.
+    async fn settle_slot(&mut self, kind: ActuationKind, authorized: bool) {
+        let slot = match kind {
+            ActuationKind::Apply => &mut self.brake_task,
+            ActuationKind::Release => &mut self.release_task,
+        };
+        match (slot.take(), authorized) {
+            (None, _) => {}
+            (Some(task), true) => self.await_in_flight(kind, task).await,
+            (Some(task), false) => task.abort(),
+        }
     }
 
     /// Bounded join of an already-running actuation during shutdown; the
@@ -585,21 +580,20 @@ fn log_safety_snapshot(snap: &SafetySnapshot, warned_brake_held_sim: &mut bool) 
         eprintln!("[relay] SAFETY {level}: {}", snap.last_reason);
     }
     match snap.state {
-        SafetyState::SimulatedSoftwareOnly if snap.brake_engaged => {
-            if !*warned_brake_held_sim {
-                eprintln!(
-                    "[relay] SAFETY: brake held — telemetry is simulated (no real GPU readings to confirm safe release)"
-                );
-                *warned_brake_held_sim = true;
-            }
+        // Warn once per episode; the flag resets on the first non-held state.
+        SafetyState::SimulatedSoftwareOnly if snap.brake_engaged && !*warned_brake_held_sim => {
+            eprintln!(
+                "[relay] SAFETY: brake held — telemetry is simulated (no real GPU readings to confirm safe release)"
+            );
+            *warned_brake_held_sim = true;
         }
-        SafetyState::ActuatorFailure => {
-            if snap.actuator_failed
-                && let Some(err) = &snap.last_actuator_error
-            {
+        SafetyState::SimulatedSoftwareOnly if snap.brake_engaged => {}
+        SafetyState::ActuatorFailure if snap.actuator_failed => {
+            if let Some(err) = &snap.last_actuator_error {
                 eprintln!("[relay] SAFETY actuator failure: {err}");
             }
         }
+        SafetyState::ActuatorFailure => {}
         SafetyState::HealthyReal | SafetyState::Recovering | SafetyState::SimulatedSoftwareOnly => {
             *warned_brake_held_sim = false;
         }
@@ -702,6 +696,7 @@ mod tests {
     use crate::safety::FakeActuator;
     use crate::telemetry::{SensoryMapping, assess, fixtures, unix_now_ms};
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::time::Instant;
 
@@ -952,6 +947,8 @@ mod tests {
         frames: Mutex<VecDeque<RawTelemetry>>,
         last: Mutex<RawTelemetry>,
         hang: Mutex<Option<mpsc::Receiver<()>>>,
+        /// False once `unhang()` ran; a woken worker then must not re-arm.
+        hang_armed: AtomicBool,
         calls: Mutex<u32>,
         hang_entered: Mutex<Option<mpsc::Sender<()>>>,
     }
@@ -964,6 +961,7 @@ mod tests {
                 frames: Mutex::new(frames),
                 last: Mutex::new(last),
                 hang: Mutex::new(None),
+                hang_armed: AtomicBool::new(false),
                 calls: Mutex::new(0),
                 hang_entered: Mutex::new(None),
             }
@@ -975,12 +973,14 @@ mod tests {
         fn hang_until_released(&self) -> (mpsc::Sender<()>, mpsc::Receiver<()>) {
             let (release_tx, release_rx) = mpsc::channel();
             let (entered_tx, entered_rx) = mpsc::channel();
+            self.hang_armed.store(true, Ordering::Release);
             *self.hang.lock().unwrap() = Some(release_rx);
             *self.hang_entered.lock().unwrap() = Some(entered_tx);
             (release_tx, entered_rx)
         }
 
         fn unhang(&self) {
+            self.hang_armed.store(false, Ordering::Release);
             *self.hang.lock().unwrap() = None;
             *self.hang_entered.lock().unwrap() = None;
         }
@@ -1006,8 +1006,11 @@ mod tests {
                 }
                 // Wait for release; a dropped sender releases too.
                 let _ = rx.recv();
-                // Re-arm so later calls keep blocking while the test wants it.
-                *self.hang.lock().unwrap() = Some(rx);
+                // Re-arm so later calls keep blocking while the test still
+                // wants it; `unhang()` in the meantime cancels the re-arm.
+                if self.hang_armed.load(Ordering::Acquire) {
+                    *self.hang.lock().unwrap() = Some(rx);
+                }
             }
             let next = self.frames.lock().unwrap().pop_front();
             next.unwrap_or_else(|| self.last.lock().unwrap().clone())
@@ -1068,12 +1071,11 @@ mod tests {
         }
     }
 
-    /// Publisher whose every call blocks the caller: a consumer that never
-    /// drains and a producer that would wait on it. The supervisor must never
-    /// call this on the safety path in a way that waits.
+    /// Publisher backed by a bounded queue whose consumer never drains.
+    /// Overflow is dropped, never awaited; `calls` counts publish attempts.
     struct CountingSlowPublisher {
         queue: IsolatedPublishQueue<SensoryMapping>,
-        calls: Mutex<u32>,
+        calls: Arc<Mutex<u32>>,
     }
 
     impl SensoryPublisher for CountingSlowPublisher {
@@ -1265,6 +1267,9 @@ mod tests {
         settle(&sup).await;
         let report = step_until(&mut sup, 50, |r| r.snapshot.brake_engaged).await;
         assert_eq!(report.actuation, Some(ActuatorOutcome::Applied));
+        // The post-apply re-read reached the recovered driver (healthy frame),
+        // so the machine is Recovering rather than still fail-closed.
+        assert_eq!(report.snapshot.state, SafetyState::Recovering);
         assert!(fake.is_engaged());
         assert_eq!(fake.apply_calls(), 1);
     }
@@ -1468,13 +1473,14 @@ mod tests {
     #[tokio::test]
     async fn slow_consumer_publisher_never_delays_or_alters_safety() {
         let (queue, consumer) = IsolatedPublishQueue::<SensoryMapping>::bounded(2).unwrap();
+        let publish_calls = Arc::new(Mutex::new(0u32));
         let probe = queue.clone();
         let fake = Arc::new(FakeActuator::new());
         let mut sup = harness()
             .actuator(fake.clone())
             .publisher(CountingSlowPublisher {
                 queue,
-                calls: Mutex::new(0),
+                calls: Arc::clone(&publish_calls),
             })
             .frames([fixtures::healthy_real()])
             .build();
@@ -1485,6 +1491,7 @@ mod tests {
             assert_eq!(report.snapshot.state, SafetyState::HealthyReal);
         }
         assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(*publish_calls.lock().unwrap(), 30, "one attempt per tick");
         let snapshot = probe.snapshot();
         assert!(snapshot.dropped_total() >= 28, "{snapshot:?}");
         assert!(consumer.try_recv().is_some());
