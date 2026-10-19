@@ -279,9 +279,8 @@ impl Supervisor {
     ) -> bool {
         if !should_evaluate_tick(step_count, telemetry.source) {
             // Publication is outside the safety critical path and never awaited.
-            let _ = self
-                .publisher
-                .try_publish(&telemetry.to_sensory_mapping_at((self.clock)()));
+            // Same mapping-time basis as evaluate_then_try_publish.
+            let _ = self.publisher.try_publish(&telemetry.to_sensory_mapping());
             return false;
         }
         let prior_intent = self.machine.snapshot().intent;
@@ -579,29 +578,32 @@ fn log_safety_snapshot(snap: &SafetySnapshot, warned_brake_held_sim: &mut bool) 
     if let Some(level) = alert_level_on_transition(snap) {
         eprintln!("[relay] SAFETY {level}: {}", snap.last_reason);
     }
+    // A newly recorded failure always carries its error and reports
+    // ActuatorFailure (see SafetyMachine::compose_and_store).
+    if snap.actuator_failed
+        && let Some(err) = &snap.last_actuator_error
+    {
+        eprintln!("[relay] SAFETY actuator failure: {err}");
+    }
+    *warned_brake_held_sim = brake_held_sim_warned(snap, *warned_brake_held_sim);
+}
+
+/// Warn once per episode that simulated telemetry is holding a real brake;
+/// the flag resets on the first state that is not a held-simulated brake.
+fn brake_held_sim_warned(snap: &SafetySnapshot, already_warned: bool) -> bool {
     match snap.state {
-        // Warn once per episode; the flag resets on the first non-held state.
-        SafetyState::SimulatedSoftwareOnly if snap.brake_engaged && !*warned_brake_held_sim => {
-            eprintln!(
-                "[relay] SAFETY: brake held — telemetry is simulated (no real GPU readings to confirm safe release)"
-            );
-            *warned_brake_held_sim = true;
-        }
-        SafetyState::SimulatedSoftwareOnly if snap.brake_engaged => {}
-        SafetyState::ActuatorFailure if snap.actuator_failed => {
-            if let Some(err) = &snap.last_actuator_error {
-                eprintln!("[relay] SAFETY actuator failure: {err}");
+        SafetyState::SimulatedSoftwareOnly if snap.brake_engaged => {
+            if !already_warned {
+                eprintln!(
+                    "[relay] SAFETY: brake held — telemetry is simulated (no real GPU readings to confirm safe release)"
+                );
             }
+            true
         }
-        SafetyState::ActuatorFailure => {}
         SafetyState::HealthyReal | SafetyState::Recovering | SafetyState::SimulatedSoftwareOnly => {
-            *warned_brake_held_sim = false;
+            false
         }
-        SafetyState::CriticalBraked
-        | SafetyState::TelemetryMissing
-        | SafetyState::TelemetryStale
-        | SafetyState::TelemetryInvalid
-        | SafetyState::Warning => {}
+        _ => already_warned,
     }
 }
 
