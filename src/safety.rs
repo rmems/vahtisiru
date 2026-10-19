@@ -289,8 +289,9 @@ pub struct SafetySnapshot {
     pub last_reason: String,
     /// Closed reason code matching [`Self::last_reason`].
     pub reason_code: SafetyReason,
-    /// Deterministic trip event: `Some(code)` on the step where policy newly
-    /// wants the brake (rising edge of `desired_brake`), else `None`.
+    /// Deterministic trip event: `Some(code)` on the [`SafetyMachine::evaluate`]
+    /// step that opens a fail-closed episode (critical/missing/invalid/stale
+    /// while no episode is open), else `None`. Never set by actuator feedback.
     pub trip: Option<SafetyReason>,
     /// Last apply/release error, if the overlay is active.
     pub last_actuator_error: Option<String>,
@@ -393,7 +394,7 @@ impl SafetyMachine {
         self.actuator_failures_total
     }
 
-    /// Deterministic trip events (rising edges of `desired_brake`) observed.
+    /// Deterministic trip events (fail-closed episodes opened) observed.
     #[must_use]
     pub fn trips_total(&self) -> u64 {
         self.trips_total
@@ -433,7 +434,38 @@ impl SafetyMachine {
         self.last_policy_state = policy_state;
         self.last_reason = assessment.reason;
         self.reason_code = assessment.code;
-        self.compose_and_store(desired_brake, false)
+        let trip = self.update_trip_latch(assessment.kind, desired_brake);
+        self.compose_and_store(desired_brake, false, trip)
+    }
+
+    /// Trip bookkeeping only; never affects brake decisions.
+    ///
+    /// A trip is a fail-closed classification (critical, missing, invalid,
+    /// stale) while no trip episode is open. The episode stays open until an
+    /// evaluation finds the brake neither wanted nor engaged, so holding,
+    /// re-applying after release, recovery, and late actuator acks (handled
+    /// in [`Self::record_actuator`], which never touches the latch) are not
+    /// new trips.
+    fn update_trip_latch(
+        &mut self,
+        kind: AssessmentKind,
+        desired_brake: bool,
+    ) -> Option<SafetyReason> {
+        let fail_closed = matches!(
+            kind,
+            AssessmentKind::Critical
+                | AssessmentKind::Missing
+                | AssessmentKind::Invalid
+                | AssessmentKind::Stale
+        );
+        let trip = (fail_closed && !self.trip_latched).then_some(self.reason_code);
+        if trip.is_some() {
+            self.trip_latched = true;
+            self.trips_total = self.trips_total.saturating_add(1);
+        } else if !desired_brake && !self.brake_engaged {
+            self.trip_latched = false;
+        }
+        trip
     }
 
     /// Record a completed actuator attempt. Does not re-read telemetry.
@@ -471,7 +503,7 @@ impl SafetyMachine {
                 actuator_failed = true;
             }
         }
-        self.compose_and_store(self.desired_from_last_policy(), actuator_failed)
+        self.compose_and_store(self.desired_from_last_policy(), actuator_failed, None)
     }
 
     fn policy_for(
@@ -524,7 +556,12 @@ impl SafetyMachine {
         }
     }
 
-    fn compose_and_store(&mut self, desired_brake: bool, actuator_failed: bool) -> SafetySnapshot {
+    fn compose_and_store(
+        &mut self,
+        desired_brake: bool,
+        actuator_failed: bool,
+        trip: Option<SafetyReason>,
+    ) -> SafetySnapshot {
         let prev = self.state;
         let reported = if self.last_actuator_error.is_some() {
             SafetyState::ActuatorFailure
@@ -538,13 +575,6 @@ impl SafetyMachine {
             None
         };
         self.state = reported;
-        let trip = if desired_brake && !self.trip_latched {
-            self.trips_total = self.trips_total.saturating_add(1);
-            Some(self.reason_code)
-        } else {
-            None
-        };
-        self.trip_latched = desired_brake;
         SafetySnapshot {
             state: reported,
             policy_state: self.last_policy_state,

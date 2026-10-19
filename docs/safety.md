@@ -107,9 +107,14 @@ Every `FrameAssessment` and `SafetySnapshot` carries a closed
 `brake_released`, `apply_failed`, `release_failed`, `healthy`, `simulated`).
 Free-text `last_reason` stays for logs only and is never a metric label.
 
-`SafetySnapshot::trip` is `Some(code)` exactly on the step where policy newly
-wants the brake (rising edge of `desired_brake`), and `None` while the brake
-is merely held, on actuator feedback, and on leftover-brake adoption. The
+`SafetySnapshot::trip` is `Some(code)` only on the `evaluate` step that opens a
+fail-closed episode: a critical, missing, invalid or stale classification
+while no episode is open. The episode stays open until an evaluation finds the
+brake neither wanted nor engaged. So holding the brake, a warn-band re-apply
+right after a release, a warn frame while a release is in flight, recovery,
+and late actuator acks are not new trips. `record_actuator` never emits a trip,
+and adopting a leftover brake opens an episode without counting one. This
+bookkeeping never changes `desired_brake`, the intent, or the state. The
 supervisor logs `SAFETY TRIP reason=<code> state=<state>` and increments
 `safety_trips_total{reason}`.
 
@@ -235,7 +240,7 @@ Exported without querying Brainstem:
 | `safety_hysteresis_ok_count` | gauge | Ok streak while braked |
 | `safety_transitions_total` | counter | reported-state changes |
 | `safety_actuator_failures_total` | counter | apply/release errors |
-| `safety_trips_total{reason}` | counter | deterministic trip events (rising edge of `desired_brake`); closed `SafetyReason` label set, all pre-registered at 0 |
+| `safety_trips_total{reason}` | counter | deterministic trip events (one per fail-closed episode, see above); closed `SafetyReason` label set, all pre-registered at 0 |
 | `telemetry_freshness_s` | gauge | sample age at scrape time (monotonic receive instant) |
 | `sensory_queue_depth` | gauge | frames currently buffered |
 | `sensory_queue_capacity` | gauge | configured finite capacity |

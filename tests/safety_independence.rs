@@ -10,7 +10,7 @@
 //! 2. Thresholds, freshness, and hysteresis behave exactly at their
 //!    boundaries, and missing/stale/invalid telemetry fails closed.
 //! 3. Every deterministic trip emits one structured, closed-vocabulary
-//!    [`SafetyReason`] event on its rising edge.
+//!    [`SafetyReason`] event when its fail-closed episode opens.
 //! 4. A panicking sensory publisher cannot unwind through the safety loop.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -661,6 +661,84 @@ fn every_trip_emits_exactly_one_rising_edge_event_with_reason_code() {
     let again = m.evaluate(&assess(&raw(Some(60.0), None), fixtures::NOW));
     assert_eq!(again.trip, Some(SafetyReason::PowerMissing));
     assert_eq!(m.trips_total(), 2);
+}
+
+/// Blocks review (PR #85): the apply runs off the evaluation path, so frames
+/// keep arriving before the actuator ack. A late ack after the frame dropped
+/// into the warn band must not emit a second (mislabelled) trip.
+#[test]
+fn late_apply_ack_after_warn_frame_is_not_a_second_trip() {
+    let mut m = machine();
+    let steps = [
+        m.evaluate(&frame(90.0, 200.0)),
+        m.evaluate(&frame(80.0, 200.0)),
+        m.record_actuator(ActuatorOutcome::Applied),
+        m.evaluate(&frame(80.0, 200.0)),
+    ];
+    let trips: Vec<_> = steps.iter().map(|s| s.trip).collect();
+    assert_eq!(
+        (trips, m.trips_total()),
+        (
+            vec![Some(SafetyReason::ThermalCritical), None, None, None],
+            1
+        )
+    );
+    // Brake decisions are unchanged by the trip bookkeeping.
+    let desired: Vec<_> = steps.iter().map(|s| (s.desired_brake, s.intent)).collect();
+    assert_eq!(
+        desired,
+        vec![
+            (true, BrakeIntent::Apply),
+            (false, BrakeIntent::None),
+            (true, BrakeIntent::None),
+            (true, BrakeIntent::None),
+        ]
+    );
+}
+
+/// Blocks review (PR #85): a warn-band frame arriving while the release is in
+/// flight (and again right after the Released ack) holds or re-applies the
+/// brake, but the brake never came off in between, so it is not a new trip.
+#[test]
+fn warn_frame_while_release_in_flight_is_not_a_new_trip() {
+    let mut m = braked_machine();
+    assert_eq!(m.trips_total(), 1);
+    let ok = frame(60.0, 200.0);
+    let _ = m.evaluate(&ok);
+    let _ = m.evaluate(&ok);
+    let steps = [
+        m.evaluate(&ok),
+        m.evaluate(&frame(80.0, 200.0)),
+        m.record_actuator(ActuatorOutcome::Released),
+        m.evaluate(&frame(80.0, 200.0)),
+    ];
+    let trips: Vec<_> = steps.iter().map(|s| s.trip).collect();
+    assert_eq!((trips, m.trips_total()), (vec![None; 4], 1));
+    let decisions: Vec<_> = steps
+        .iter()
+        .map(|s| (s.state, s.desired_brake, s.intent))
+        .collect();
+    assert_eq!(
+        decisions,
+        vec![
+            (SafetyState::Recovering, false, BrakeIntent::Release),
+            (SafetyState::Warning, true, BrakeIntent::None),
+            (SafetyState::HealthyReal, false, BrakeIntent::None),
+            (SafetyState::Warning, true, BrakeIntent::Apply),
+        ]
+    );
+    // A genuine re-trip after the brake really came off still emits.
+    let _ = m.record_actuator(ActuatorOutcome::Applied);
+    for _ in 0..3 {
+        let _ = m.evaluate(&ok);
+    }
+    let _ = m.record_actuator(ActuatorOutcome::Released);
+    assert_eq!(m.evaluate(&ok).state, SafetyState::HealthyReal);
+    let again = m.evaluate(&frame(90.0, 200.0));
+    assert_eq!(
+        (again.trip, m.trips_total()),
+        (Some(SafetyReason::ThermalCritical), 2)
+    );
 }
 
 #[test]

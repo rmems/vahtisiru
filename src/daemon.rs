@@ -855,7 +855,7 @@ fn store_safety(
     cpu::record_safety_snapshot(&mut metrics, snap);
 }
 
-/// Structured trip line; emitted once per deterministic trip (rising edge).
+/// Structured trip line; emitted once per deterministic trip episode.
 fn log_safety_trip(snap: &SafetySnapshot) {
     if let Some(code) = snap.trip {
         eprintln!(
