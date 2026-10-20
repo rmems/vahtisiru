@@ -58,6 +58,7 @@ mod cpu;
 mod daemon;
 mod gpu;
 mod nvml_gate;
+mod supervisor;
 
 pub mod publish;
 pub mod safety;
