@@ -72,6 +72,14 @@ require querying neural state.
 `--force-software-only` is the only simulated path; simulated numbers never
 drive thresholds.
 
+Classification re-validates every safety sample that claims `Valid`. The value
+must be finite, inside the channel's own contract range (0–125 °C, 0–2000 W),
+labelled as that channel, and observed no later than the frame's
+`acquired_at` (zero tolerance, the same rule `TelemetrySample::from_raw`
+applies against `now`). Otherwise it is `telemetry_invalid`, even when the
+frame was built by hand or deserialized rather than produced by
+`TelemetrySample::from_raw`.
+
 When missing, invalid, and stale appear on different safety channels, the
 worst fault wins: **missing > invalid > stale**. Equal rank prefers
 `gpu_temp_c` (stable, matches the previous temp-then-power order).
@@ -96,6 +104,44 @@ on that cadence rather than every tick. `SafetyMachine::evaluate`
 never publishes and never calls `nvidia-smi`. Pre-telemetry snapshots are
 not dispatched as hardware commands: `--force-software-only` must be
 classified first (hold, do not apply).
+
+## Trip events and reason codes
+
+Every `FrameAssessment` and `SafetySnapshot` carries a closed
+`SafetyReason` code (`thermal_critical`, `power_critical`, `thermal_warn`,
+`power_warn`, `temp_missing`, `power_missing`, `temp_invalid`,
+`power_invalid`, `temp_stale`, `power_stale`, `policy_stale`,
+`power_policy_unavailable`, `no_telemetry_yet`, `leftover_brake`,
+`brake_released`, `apply_failed`, `release_failed`, `healthy`, `simulated`).
+Free-text `last_reason` stays for logs only and is never a metric label.
+
+`SafetySnapshot::trip` is `Some(code)` only on the `evaluate` step that opens a
+fail-closed episode: a critical, missing, invalid or stale classification
+while no episode is open. The episode stays open until an evaluation finds the
+brake not wanted, not engaged, and with no apply still in flight. "In flight"
+means the supervisor actually spawned the apply worker
+(`SafetyMachine::apply_dispatched`) and `Applied` or `ApplyFailed` has not been
+recorded yet. An `Apply` intent that is never dispatched, for example parked
+while the NVML gate is busy and then dropped when the intent changes, does not
+hold the episode open, so the next real trip is still reported. So holding the brake, a warn-band re-apply
+right after a release, a warn frame while a release is in flight, recovery,
+and late actuator acks are not new trips. `record_actuator` never emits a trip,
+and adopting a leftover brake opens an episode without counting one. This
+bookkeeping never changes `desired_brake`, the intent, or the state. The
+supervisor logs `SAFETY TRIP reason=<code> state=<state>` and increments
+`safety_trips_total{reason}`.
+
+## Learned components have no input
+
+`SafetyMachine::evaluate` takes only a `TelemetryFrame` and its immutable
+`SafetyPolicy`. There is no parameter, trait, or IPC message through which a
+learned / SNN / Brainstem component can suppress, delay, or override a trip.
+`tests/safety_independence.rs` proves the snapshot sequence is identical when
+a shadow advisor is absent, panics, returns NaN/inf garbage, or recommends the
+opposite action, and statically checks that `src/safety*.rs` does not
+reference `corpus_ipc`, `publish`, `gpu`, `daemon`, NVML, tokio, or Brainstem.
+Sensory publication runs inside `try_publish_isolated`, so a panicking
+publisher is contained and reported as `SendFailed("sensory publisher panicked")`.
 
 ## Configurable policy
 
@@ -207,6 +253,7 @@ Exported without querying Brainstem:
 | `safety_hysteresis_ok_count` | gauge | Ok streak while braked |
 | `safety_transitions_total` | counter | reported-state changes |
 | `safety_actuator_failures_total` | counter | apply/release errors |
+| `safety_trips_total{reason}` | counter | deterministic trip events (one per fail-closed episode, see above); closed `SafetyReason` label set, all pre-registered at 0 |
 | `telemetry_freshness_s` | gauge | sample age at scrape time (monotonic receive instant) |
 | `sensory_queue_depth` | gauge | frames currently buffered |
 | `sensory_queue_capacity` | gauge | configured finite capacity |

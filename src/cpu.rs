@@ -13,7 +13,7 @@ use tracing::{Level, info};
 use tracing_subscriber::FmtSubscriber;
 
 use crate::publish::register_sensory_queue_metrics_without_queue;
-use crate::safety::{SafetySnapshot, SafetyState};
+use crate::safety::{SafetyReason, SafetySnapshot, SafetyState};
 use crate::shutdown::ShutdownPlan;
 use crate::telemetry::UnixMillis;
 use crate::time::freshness_seconds_monotonic;
@@ -77,6 +77,17 @@ pub fn record_safety_snapshot(metrics: &mut RelayMetrics, snap: &SafetySnapshot)
     if snap.actuator_failed {
         counter!("safety_actuator_failures_total").increment(1);
     }
+    if let Some(code) = snap.trip {
+        counter!("safety_trips_total", "reason" => code.as_str()).increment(1);
+    }
+}
+
+/// Pre-register every `safety_trips_total{reason}` series at zero so a scrape
+/// can distinguish "never tripped" from "metric missing".
+pub fn register_safety_trip_series() {
+    for code in SafetyReason::ALL {
+        counter!("safety_trips_total", "reason" => code.as_str()).increment(0);
+    }
 }
 
 /// One-hot + numeric safety gauges. Safe to call from the collector refresh.
@@ -131,6 +142,7 @@ pub fn init_telemetry(metrics_addr: std::net::SocketAddr) {
         .expect("Failed to install Prometheus recorder");
 
     register_sensory_queue_metrics_without_queue();
+    register_safety_trip_series();
 
     info!(
         "Telemetry initialized. Prometheus metrics available on http://{}/metrics",
@@ -252,6 +264,37 @@ mod tests {
         assert_eq!(metrics.safety_state, SafetyState::CriticalBraked);
         assert!(!metrics.brake_engaged);
         assert_eq!(metrics.policy_state, SafetyState::CriticalBraked);
+    }
+
+    #[test]
+    fn safety_trip_and_transition_counters_are_exported_with_reason_label() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            register_safety_trip_series();
+            let mut metrics = RelayMetrics::default();
+            let mut machine = crate::safety::test_machine();
+            let mut raw = fixtures::healthy_real();
+            raw.gpu_temp_c = Some(90.0);
+            let snap = machine.evaluate(&assess(&raw, fixtures::NOW));
+            record_safety_snapshot(&mut metrics, &snap);
+            // Held critical frame: no second trip event.
+            let snap = machine.evaluate(&assess(&raw, fixtures::NOW));
+            record_safety_snapshot(&mut metrics, &snap);
+        });
+        let text = handle.render();
+        let expected = [
+            "safety_trips_total{reason=\"thermal_critical\"} 1",
+            "safety_trips_total{reason=\"power_missing\"} 0",
+            "safety_transitions_total 1",
+            "safety_state{state=\"critical_braked\"} 1",
+        ];
+        let missing: Vec<_> = expected.iter().filter(|l| !text.contains(*l)).collect();
+        assert!(missing.is_empty(), "missing {missing:?} in:\n{text}");
+        assert_eq!(
+            text.matches("safety_trips_total{").count(),
+            SafetyReason::ALL.len()
+        );
     }
 
     #[test]

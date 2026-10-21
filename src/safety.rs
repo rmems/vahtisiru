@@ -10,7 +10,9 @@
 //! Named states and hysteresis are documented in the repository file
 //! `docs/safety.md`. This machine does not run neural computation.
 
-use crate::telemetry::{SampleValidity, TelemetryFrame, TelemetrySample, TelemetrySource};
+use crate::telemetry::{
+    SampleValidity, TelemetryFrame, TelemetrySample, TelemetrySource, UnixMillis,
+};
 use std::sync::Mutex;
 
 mod policy;
@@ -116,6 +118,105 @@ impl SafetyState {
     }
 }
 
+/// Closed, machine-readable reason for a safety classification or event.
+///
+/// Every [`FrameAssessment`] and [`SafetySnapshot`] carries one. Unlike the
+/// human-readable `reason` strings, this vocabulary is stable and bounded, so
+/// it is safe as a Prometheus label (`safety_trips_total{reason=...}`) and as
+/// a test oracle. Do not derive codes from free-text messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SafetyReason {
+    /// Valid real telemetry below every warn threshold.
+    Healthy,
+    /// `TelemetrySource::SoftwareFallback`: thresholds are not evaluated.
+    Simulated,
+    /// GPU temperature exceeds the critical limit.
+    ThermalCritical,
+    /// Board power exceeds the critical limit.
+    PowerCritical,
+    /// GPU temperature is in the warn band.
+    ThermalWarn,
+    /// Board power is in the warn band.
+    PowerWarn,
+    /// `gpu_temp_c` sample missing (dropout, NVML unavailable, or Valid+`None`).
+    TempMissing,
+    /// `power_w` sample missing.
+    PowerMissing,
+    /// `gpu_temp_c` non-finite, out of range, or future-dated.
+    TempInvalid,
+    /// `power_w` non-finite, out of range, or future-dated.
+    PowerInvalid,
+    /// `gpu_temp_c` older than the telemetry contract stale threshold.
+    TempStale,
+    /// `power_w` older than the telemetry contract stale threshold.
+    PowerStale,
+    /// Sample age or acquisition interval exceeds the configured policy.
+    PolicyStale,
+    /// No device default and no explicit power limits: cannot authorize real health.
+    PowerPolicyUnavailable,
+    /// Machine constructed; no frame evaluated yet (fail closed).
+    NoTelemetryYet,
+    /// Relay-owned brake adopted at startup.
+    LeftoverBrake,
+    /// Actuator reported a successful release.
+    BrakeReleased,
+    /// Actuator apply attempt failed.
+    ApplyFailed,
+    /// Actuator release attempt failed.
+    ReleaseFailed,
+}
+
+impl SafetyReason {
+    /// Every reason code, in stable order. Prometheus cardinality is this length.
+    pub const ALL: [Self; 19] = [
+        Self::Healthy,
+        Self::Simulated,
+        Self::ThermalCritical,
+        Self::PowerCritical,
+        Self::ThermalWarn,
+        Self::PowerWarn,
+        Self::TempMissing,
+        Self::PowerMissing,
+        Self::TempInvalid,
+        Self::PowerInvalid,
+        Self::TempStale,
+        Self::PowerStale,
+        Self::PolicyStale,
+        Self::PowerPolicyUnavailable,
+        Self::NoTelemetryYet,
+        Self::LeftoverBrake,
+        Self::BrakeReleased,
+        Self::ApplyFailed,
+        Self::ReleaseFailed,
+    ];
+
+    /// Stable snake_case label for logs and Prometheus.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Simulated => "simulated",
+            Self::ThermalCritical => "thermal_critical",
+            Self::PowerCritical => "power_critical",
+            Self::ThermalWarn => "thermal_warn",
+            Self::PowerWarn => "power_warn",
+            Self::TempMissing => "temp_missing",
+            Self::PowerMissing => "power_missing",
+            Self::TempInvalid => "temp_invalid",
+            Self::PowerInvalid => "power_invalid",
+            Self::TempStale => "temp_stale",
+            Self::PowerStale => "power_stale",
+            Self::PolicyStale => "policy_stale",
+            Self::PowerPolicyUnavailable => "power_policy_unavailable",
+            Self::NoTelemetryYet => "no_telemetry_yet",
+            Self::LeftoverBrake => "leftover_brake",
+            Self::BrakeReleased => "brake_released",
+            Self::ApplyFailed => "apply_failed",
+            Self::ReleaseFailed => "release_failed",
+        }
+    }
+}
+
 /// Brake command the supervisor may dispatch to a [`SafetyActuator`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrakeIntent {
@@ -165,7 +266,9 @@ pub enum AssessmentKind {
 pub struct FrameAssessment {
     /// Stateless kind (no hysteresis).
     pub kind: AssessmentKind,
-    /// Human-readable reason suitable for logs and metrics.
+    /// Closed machine-readable reason code.
+    pub code: SafetyReason,
+    /// Human-readable reason suitable for logs (never a metric label).
     pub reason: String,
 }
 
@@ -186,6 +289,12 @@ pub struct SafetySnapshot {
     pub hysteresis_ok_count: u32,
     /// Reason from the latest classification or actuator feedback.
     pub last_reason: String,
+    /// Closed reason code matching [`Self::last_reason`].
+    pub reason_code: SafetyReason,
+    /// Deterministic trip event: `Some(code)` on the [`SafetyMachine::evaluate`]
+    /// step that opens a fail-closed episode (critical/missing/invalid/stale
+    /// while no episode is open), else `None`. Never set by actuator feedback.
+    pub trip: Option<SafetyReason>,
     /// Last apply/release error, if the overlay is active.
     pub last_actuator_error: Option<String>,
     /// Named-state change this step, if any.
@@ -229,8 +338,12 @@ pub struct SafetyMachine {
     last_policy_state: SafetyState,
     state: SafetyState,
     last_reason: String,
+    reason_code: SafetyReason,
+    trip_latched: bool,
+    apply_pending: bool,
     transitions_total: u64,
     actuator_failures_total: u64,
+    trips_total: u64,
 }
 
 impl Default for SafetyMachine {
@@ -264,8 +377,12 @@ impl SafetyMachine {
             last_policy_state: SafetyState::TelemetryMissing,
             state: SafetyState::TelemetryMissing,
             last_reason: "no telemetry evaluated yet".to_string(),
+            reason_code: SafetyReason::NoTelemetryYet,
+            trip_latched: false,
+            apply_pending: false,
             transitions_total: 0,
             actuator_failures_total: 0,
+            trips_total: 0,
         }
     }
 
@@ -281,6 +398,12 @@ impl SafetyMachine {
         self.actuator_failures_total
     }
 
+    /// Deterministic trip events (fail-closed episodes opened) observed.
+    #[must_use]
+    pub fn trips_total(&self) -> u64 {
+        self.trips_total
+    }
+
     /// Seed leftover hardware throttle detected at process start.
     pub fn seed_brake_applied(&mut self) {
         self.brake_engaged = true;
@@ -289,6 +412,9 @@ impl SafetyMachine {
         self.last_policy_state = SafetyState::Recovering;
         self.state = SafetyState::Recovering;
         self.last_reason = "leftover emergency brake detected at startup".to_string();
+        self.reason_code = SafetyReason::LeftoverBrake;
+        // Adoption is not a new trip; release still requires the Ok streak.
+        self.trip_latched = true;
     }
 
     /// Current snapshot without advancing hysteresis.
@@ -311,7 +437,56 @@ impl SafetyMachine {
         }
         self.last_policy_state = policy_state;
         self.last_reason = assessment.reason;
-        self.compose_and_store(desired_brake, false)
+        self.reason_code = assessment.code;
+        let trip = self.update_trip_latch(assessment.kind, desired_brake);
+        self.compose_and_store(desired_brake, false, trip)
+    }
+
+    /// The supervisor actually dispatched an apply (worker spawned). Until
+    /// [`Self::record_actuator`] reports `Applied` or `ApplyFailed`, the brake
+    /// may still come on, so the open trip episode is held. An `Apply` intent
+    /// that is never dispatched (for example dropped after the NVML gate was
+    /// busy) does not hold the episode. Bookkeeping only; never affects brake
+    /// decisions.
+    pub fn apply_dispatched(&mut self) {
+        self.apply_pending = true;
+    }
+
+    /// Trip bookkeeping only; never affects brake decisions.
+    ///
+    /// A trip is a fail-closed classification (critical, missing, invalid,
+    /// stale) while no trip episode is open. The episode stays open until an
+    /// evaluation finds the brake neither wanted, engaged, nor with a
+    /// dispatched apply still in flight (see [`Self::apply_dispatched`]), so
+    /// holding,
+    /// re-applying after release, recovery, and late actuator acks (handled
+    /// in [`Self::record_actuator`], which never touches the latch) are not
+    /// new trips.
+    fn update_trip_latch(
+        &mut self,
+        kind: AssessmentKind,
+        desired_brake: bool,
+    ) -> Option<SafetyReason> {
+        let fail_closed = matches!(
+            kind,
+            AssessmentKind::Critical
+                | AssessmentKind::Missing
+                | AssessmentKind::Invalid
+                | AssessmentKind::Stale
+        );
+        let trip = (fail_closed && !self.trip_latched).then_some(self.reason_code);
+        if trip.is_some() {
+            self.trip_latched = true;
+            self.trips_total = self.trips_total.saturating_add(1);
+        } else if self.trip_episode_can_close(desired_brake) {
+            self.trip_latched = false;
+        }
+        trip
+    }
+
+    /// The brake is off for real: not wanted, not engaged, no apply in flight.
+    fn trip_episode_can_close(&self, desired_brake: bool) -> bool {
+        !desired_brake && !self.brake_engaged && !self.apply_pending
     }
 
     /// Record a completed actuator attempt. Does not re-read telemetry.
@@ -320,11 +495,15 @@ impl SafetyMachine {
         let mut actuator_failed = false;
         match outcome {
             ActuatorOutcome::Applied => {
+                self.apply_pending = false;
                 self.brake_engaged = true;
                 self.last_actuator_error = None;
                 self.just_released = false;
             }
             ActuatorOutcome::ApplyFailed(err) => {
+                self.apply_pending = false;
+                self.reason_code = SafetyReason::ApplyFailed;
+                self.last_reason = format!("brake apply failed: {err}");
                 self.brake_engaged = false;
                 self.last_actuator_error = Some(err);
                 self.actuator_failures_total = self.actuator_failures_total.saturating_add(1);
@@ -339,14 +518,17 @@ impl SafetyMachine {
                 // telemetry. Warn/Critical on that frame re-applies.
                 self.last_policy_state = SafetyState::HealthyReal;
                 self.last_reason = "brake released".to_string();
+                self.reason_code = SafetyReason::BrakeReleased;
             }
             ActuatorOutcome::ReleaseFailed(err) => {
+                self.reason_code = SafetyReason::ReleaseFailed;
+                self.last_reason = format!("brake release failed: {err}");
                 self.last_actuator_error = Some(err);
                 self.actuator_failures_total = self.actuator_failures_total.saturating_add(1);
                 actuator_failed = true;
             }
         }
-        self.compose_and_store(self.desired_from_last_policy(), actuator_failed)
+        self.compose_and_store(self.desired_from_last_policy(), actuator_failed, None)
     }
 
     fn policy_for(
@@ -399,7 +581,12 @@ impl SafetyMachine {
         }
     }
 
-    fn compose_and_store(&mut self, desired_brake: bool, actuator_failed: bool) -> SafetySnapshot {
+    fn compose_and_store(
+        &mut self,
+        desired_brake: bool,
+        actuator_failed: bool,
+        trip: Option<SafetyReason>,
+    ) -> SafetySnapshot {
         let prev = self.state;
         let reported = if self.last_actuator_error.is_some() {
             SafetyState::ActuatorFailure
@@ -421,6 +608,8 @@ impl SafetyMachine {
             intent: SafetySnapshot::intent_from(desired_brake, self.brake_engaged),
             hysteresis_ok_count: self.ok_count,
             last_reason: self.last_reason.clone(),
+            reason_code: self.reason_code,
+            trip,
             last_actuator_error: self.last_actuator_error.clone(),
             transition,
             actuator_failed,
@@ -441,6 +630,8 @@ impl SafetyMachine {
             intent: SafetySnapshot::intent_from(desired, self.brake_engaged),
             hysteresis_ok_count: self.ok_count,
             last_reason: self.last_reason.clone(),
+            reason_code: self.reason_code,
+            trip: None,
             last_actuator_error: self.last_actuator_error.clone(),
             transition,
             actuator_failed,
@@ -494,6 +685,7 @@ pub fn classify_frame_with_policy(
     if frame.source == TelemetrySource::SoftwareFallback {
         return FrameAssessment {
             kind: AssessmentKind::Simulated,
+            code: SafetyReason::Simulated,
             reason: "telemetry source is SoftwareFallback".to_string(),
         };
     }
@@ -501,65 +693,83 @@ pub fn classify_frame_with_policy(
     if let Some(fault) = worst_safety_fault(frame) {
         return fault;
     }
-
     let (gpu_temp_c, power_w) = match safety_readings(frame) {
         Ok(v) => v,
-        Err(status) => {
-            return FrameAssessment {
-                kind: kind_from_critical_status(&status),
-                reason: status_reason(status),
-            };
-        }
+        Err(fault) => return fault,
     };
-
-    if frame.acquisition_cadence_ms > policy.config.max_acquisition_interval_ms
-        || [&frame.gpu_temp_c, &frame.power_w].iter().any(|sample| {
-            frame.acquired_at.saturating_sub(sample.observed_at) >= policy.config.max_sample_age_ms
-        })
-    {
+    if exceeds_freshness_policy(frame, policy) {
         return FrameAssessment {
             kind: AssessmentKind::Stale,
+            code: SafetyReason::PolicyStale,
             reason: "sample age or acquisition interval exceeds safety policy".into(),
         };
     }
-    let Some((power_warn_w, power_critical_w)) = policy.power_limits_w else {
+    let Some(power_limits_w) = policy.power_limits_w else {
         return FrameAssessment {
             kind: AssessmentKind::Missing,
+            code: SafetyReason::PowerPolicyUnavailable,
             reason: "power policy unavailable: provide device default or explicit limits".into(),
         };
     };
-    let temp_warn_c = policy.config.temp_warn_c;
-    let temp_critical_c = policy.config.temp_critical_c;
-    if gpu_temp_c > temp_critical_c {
-        return FrameAssessment {
-            kind: AssessmentKind::Critical,
-            reason: format!("GPU thermal: {gpu_temp_c:.0}°C exceeds {temp_critical_c:.0}°C"),
-        };
-    }
-    if power_w > power_critical_w {
-        return FrameAssessment {
-            kind: AssessmentKind::Critical,
-            reason: format!("GPU power: {power_w:.0}W exceeds {power_critical_w:.0}W safety limit"),
-        };
-    }
-    if gpu_temp_c >= temp_warn_c {
-        return FrameAssessment {
-            kind: AssessmentKind::Warn,
-            reason: format!(
-                "GPU thermal: {gpu_temp_c:.0}°C approaching {temp_critical_c:.0}°C limit"
-            ),
-        };
-    }
-    if power_w >= power_warn_w {
-        return FrameAssessment {
-            kind: AssessmentKind::Warn,
-            reason: format!("GPU power: {power_w:.0}W approaching safety limit"),
-        };
-    }
-    FrameAssessment {
-        kind: AssessmentKind::Ok,
-        reason: "healthy real telemetry".to_string(),
-    }
+    classify_thresholds(gpu_temp_c, power_w, &policy.config, power_limits_w)
+}
+
+/// Sample age or declared acquisition interval exceeds the configured policy.
+fn exceeds_freshness_policy(frame: &TelemetryFrame, policy: &SafetyPolicy) -> bool {
+    frame.acquisition_cadence_ms > policy.config.max_acquisition_interval_ms
+        || [&frame.gpu_temp_c, &frame.power_w].iter().any(|sample| {
+            // Explicit age: a future sample has no age and is never "fresh".
+            // (Future samples are already rejected as invalid above.)
+            frame
+                .acquired_at
+                .checked_sub(sample.observed_at)
+                .is_none_or(|age| age >= policy.config.max_sample_age_ms)
+        })
+}
+
+/// Threshold classification of valid, fresh readings. Order is normative:
+/// thermal critical, power critical, thermal warn, power warn, healthy.
+/// Critical is exceeded strictly; warn is inclusive.
+fn classify_thresholds(
+    gpu_temp_c: f32,
+    power_w: f32,
+    config: &SafetyPolicyConfig,
+    (power_warn_w, power_critical_w): (f32, f32),
+) -> FrameAssessment {
+    let temp_warn_c = config.temp_warn_c;
+    let temp_critical_c = config.temp_critical_c;
+    let (kind, code, reason) = if gpu_temp_c > temp_critical_c {
+        (
+            AssessmentKind::Critical,
+            SafetyReason::ThermalCritical,
+            format!("GPU thermal: {gpu_temp_c:.0}°C exceeds {temp_critical_c:.0}°C"),
+        )
+    } else if power_w > power_critical_w {
+        (
+            AssessmentKind::Critical,
+            SafetyReason::PowerCritical,
+            format!("GPU power: {power_w:.0}W exceeds {power_critical_w:.0}W safety limit"),
+        )
+    } else if gpu_temp_c >= temp_warn_c {
+        (
+            AssessmentKind::Warn,
+            SafetyReason::ThermalWarn,
+            format!("GPU thermal: {gpu_temp_c:.0}°C approaching {temp_critical_c:.0}°C limit"),
+        )
+    } else if power_w >= power_warn_w {
+        (
+            AssessmentKind::Warn,
+            SafetyReason::PowerWarn,
+            format!("GPU power: {power_w:.0}W approaching safety limit"),
+        )
+    } else {
+        (
+            AssessmentKind::Ok,
+            SafetyReason::Healthy,
+            "healthy real telemetry".to_string(),
+        )
+    };
+    FrameAssessment { kind, code, reason }
 }
 
 /// Direct warn-path helper: missing/invalid/stale fail closed as Critical.
@@ -583,73 +793,150 @@ fn warn_from_frame(frame: &TelemetryFrame) -> Option<SafetyStatus> {
     }
 }
 
-fn kind_from_critical_status(status: &SafetyStatus) -> AssessmentKind {
-    match status {
-        SafetyStatus::Critical(msg) if msg.contains("missing") => AssessmentKind::Missing,
-        SafetyStatus::Critical(msg) if msg.contains("invalid") => AssessmentKind::Invalid,
-        SafetyStatus::Critical(msg) if msg.contains("stale") => AssessmentKind::Stale,
-        SafetyStatus::Critical(_) => AssessmentKind::Critical,
-        SafetyStatus::Warn(_) => AssessmentKind::Warn,
-        SafetyStatus::Ok => AssessmentKind::Ok,
-    }
+/// Safety-critical telemetry channel. Typed so reason codes never depend on
+/// message wording (GH#42 review).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SafetyChannel {
+    GpuTemp,
+    Power,
 }
 
-fn status_reason(status: SafetyStatus) -> String {
-    match status {
-        SafetyStatus::Ok => "ok".to_string(),
-        SafetyStatus::Warn(msg) | SafetyStatus::Critical(msg) => msg,
-    }
-}
-
-fn safety_value(name: &str, sample: &TelemetrySample<f32>) -> Result<f32, SafetyStatus> {
-    match sample.validity {
-        SampleValidity::Missing => Err(SafetyStatus::Critical(format!(
-            "Invalid telemetry: {name} missing"
-        ))),
-        SampleValidity::Invalid => Err(SafetyStatus::Critical(format!(
-            "Invalid telemetry: {name} invalid"
-        ))),
-        SampleValidity::Stale => Err(SafetyStatus::Critical(format!(
-            "Invalid telemetry: {name} stale"
-        ))),
-        SampleValidity::Valid => sample
-            .value
-            .ok_or_else(|| SafetyStatus::Critical(format!("Invalid telemetry: {name} missing"))),
-    }
-}
-
-fn safety_readings(frame: &TelemetryFrame) -> Result<(f32, f32), SafetyStatus> {
-    Ok((
-        safety_value("gpu_temp_c", &frame.gpu_temp_c)?,
-        safety_value("power_w", &frame.power_w)?,
-    ))
-}
-
-fn sample_fault_rank(sample: &TelemetrySample<f32>, name: &str) -> Option<(u8, FrameAssessment)> {
-    let (rank, kind, label) = match sample.validity {
-        SampleValidity::Valid => {
-            if sample.value.is_none() {
-                (3, AssessmentKind::Missing, "missing")
-            } else {
-                return None;
-            }
+impl SafetyChannel {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::GpuTemp => "gpu_temp_c",
+            Self::Power => "power_w",
         }
-        SampleValidity::Stale => (1, AssessmentKind::Stale, "stale"),
-        SampleValidity::Invalid => (2, AssessmentKind::Invalid, "invalid"),
-        SampleValidity::Missing => (3, AssessmentKind::Missing, "missing"),
-    };
-    Some((
-        rank,
+    }
+
+    const fn signal(self) -> crate::telemetry::SignalId {
+        match self {
+            Self::GpuTemp => crate::telemetry::SignalId::GpuTempC,
+            Self::Power => crate::telemetry::SignalId::PowerW,
+        }
+    }
+
+    /// Finite, inside this channel's contract range, labelled as this channel
+    /// (a relabelled sample cannot borrow another signal's range), and not
+    /// observed after its frame was acquired. Zero tolerance, matching
+    /// `TelemetrySample::from_raw` (`observed_at > now` is invalid).
+    fn accepts(self, sample: &TelemetrySample<f32>, v: f32, acquired_at: UnixMillis) -> bool {
+        let spec = crate::telemetry::signal_spec(self.signal());
+        sample.signal == self.signal()
+            && v.is_finite()
+            && (spec.min..=spec.max).contains(&v)
+            && sample.observed_at <= acquired_at
+    }
+}
+
+/// Typed sample fault: which channel, and whether it is missing/invalid/stale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SampleFault {
+    Missing,
+    Invalid,
+    Stale,
+}
+
+impl SampleFault {
+    /// Worst-fault ranking: missing > invalid > stale.
+    const fn rank(self) -> u8 {
+        match self {
+            Self::Missing => 3,
+            Self::Invalid => 2,
+            Self::Stale => 1,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Invalid => "invalid",
+            Self::Stale => "stale",
+        }
+    }
+
+    const fn kind(self) -> AssessmentKind {
+        match self {
+            Self::Missing => AssessmentKind::Missing,
+            Self::Invalid => AssessmentKind::Invalid,
+            Self::Stale => AssessmentKind::Stale,
+        }
+    }
+
+    /// Reason code from the typed (channel, fault) pair, never from text.
+    const fn code(self, channel: SafetyChannel) -> SafetyReason {
+        match (self, channel) {
+            (Self::Missing, SafetyChannel::GpuTemp) => SafetyReason::TempMissing,
+            (Self::Missing, SafetyChannel::Power) => SafetyReason::PowerMissing,
+            (Self::Invalid, SafetyChannel::GpuTemp) => SafetyReason::TempInvalid,
+            (Self::Invalid, SafetyChannel::Power) => SafetyReason::PowerInvalid,
+            (Self::Stale, SafetyChannel::GpuTemp) => SafetyReason::TempStale,
+            (Self::Stale, SafetyChannel::Power) => SafetyReason::PowerStale,
+        }
+    }
+
+    fn assessment(self, channel: SafetyChannel) -> FrameAssessment {
         FrameAssessment {
-            kind,
-            reason: format!("Invalid telemetry: {name} {label}"),
-        },
+            kind: self.kind(),
+            code: self.code(channel),
+            reason: format!("Invalid telemetry: {} {}", channel.name(), self.label()),
+        }
+    }
+}
+
+/// Typed fault for one safety sample, or `None` when it is valid with a value.
+///
+/// `Valid` is re-checked here, independent of how the sample was built:
+/// fields are public and the type is deserializable, so a sample can claim
+/// `Valid` with NaN, ±inf, or an out-of-range value. Such a sample would
+/// otherwise slip through the threshold comparisons (NaN compares false)
+/// and fail open. It is classified `Invalid` instead.
+fn sample_fault(
+    channel: SafetyChannel,
+    sample: &TelemetrySample<f32>,
+    acquired_at: UnixMillis,
+) -> Option<SampleFault> {
+    let rejected = |v| !channel.accepts(sample, v, acquired_at);
+    match sample.validity {
+        SampleValidity::Valid if sample.value.is_some_and(rejected) => Some(SampleFault::Invalid),
+        SampleValidity::Valid if sample.value.is_some() => None,
+        SampleValidity::Valid | SampleValidity::Missing => Some(SampleFault::Missing),
+        SampleValidity::Invalid => Some(SampleFault::Invalid),
+        SampleValidity::Stale => Some(SampleFault::Stale),
+    }
+}
+
+fn safety_value(
+    channel: SafetyChannel,
+    sample: &TelemetrySample<f32>,
+    acquired_at: UnixMillis,
+) -> Result<f32, FrameAssessment> {
+    match (sample_fault(channel, sample, acquired_at), sample.value) {
+        (None, Some(v)) => Ok(v),
+        (Some(fault), _) => Err(fault.assessment(channel)),
+        (None, None) => Err(SampleFault::Missing.assessment(channel)),
+    }
+}
+
+fn safety_readings(frame: &TelemetryFrame) -> Result<(f32, f32), FrameAssessment> {
+    Ok((
+        safety_value(SafetyChannel::GpuTemp, &frame.gpu_temp_c, frame.acquired_at)?,
+        safety_value(SafetyChannel::Power, &frame.power_w, frame.acquired_at)?,
     ))
+}
+
+fn sample_fault_rank(
+    sample: &TelemetrySample<f32>,
+    channel: SafetyChannel,
+    acquired_at: UnixMillis,
+) -> Option<(u8, FrameAssessment)> {
+    sample_fault(channel, sample, acquired_at)
+        .map(|fault| (fault.rank(), fault.assessment(channel)))
 }
 
 fn worst_safety_fault(frame: &TelemetryFrame) -> Option<FrameAssessment> {
-    let temp = sample_fault_rank(&frame.gpu_temp_c, "gpu_temp_c");
-    let power = sample_fault_rank(&frame.power_w, "power_w");
+    let temp = sample_fault_rank(&frame.gpu_temp_c, SafetyChannel::GpuTemp, frame.acquired_at);
+    let power = sample_fault_rank(&frame.power_w, SafetyChannel::Power, frame.acquired_at);
     match (temp, power) {
         (None, None) => None,
         (Some((_, a)), None) | (None, Some((_, a))) => Some(a),
@@ -1441,6 +1728,76 @@ mod tests {
         let assessment = classify_frame_with_policy_test(&frame);
         assert_eq!(assessment.kind, AssessmentKind::Missing);
         assert!(assessment.reason.contains("power_w"));
+    }
+
+    /// Reason codes come from typed (channel, fault) data. This pins both the
+    /// code and the exact log wording for every safety channel and fault, so
+    /// rewording a message can neither silently change a code nor go unseen.
+    #[test]
+    fn fault_reason_codes_are_typed_not_derived_from_message_text() {
+        let cases = [
+            (
+                SampleValidity::Missing,
+                true,
+                "missing",
+                SafetyReason::TempMissing,
+                SafetyReason::PowerMissing,
+            ),
+            (
+                SampleValidity::Valid,
+                false,
+                "missing",
+                SafetyReason::TempMissing,
+                SafetyReason::PowerMissing,
+            ),
+            (
+                SampleValidity::Invalid,
+                true,
+                "invalid",
+                SafetyReason::TempInvalid,
+                SafetyReason::PowerInvalid,
+            ),
+            (
+                SampleValidity::Stale,
+                true,
+                "stale",
+                SafetyReason::TempStale,
+                SafetyReason::PowerStale,
+            ),
+        ];
+        for (validity, has_value, label, temp_code, power_code) in cases {
+            for (power, code, name) in [
+                (false, temp_code, "gpu_temp_c"),
+                (true, power_code, "power_w"),
+            ] {
+                let mut frame = nvml_temp_power(60.0, 200.0);
+                let sample = if power {
+                    &mut frame.power_w
+                } else {
+                    &mut frame.gpu_temp_c
+                };
+                sample.validity = validity;
+                if !has_value {
+                    sample.value = None;
+                }
+                let a = classify_frame_with_policy_test(&frame);
+                assert_eq!(a.code, code, "{name} {validity:?}");
+                assert_eq!(a.reason, format!("Invalid telemetry: {name} {label}"));
+            }
+        }
+        // The typed mapping is independent of any message: the code for a
+        // fault on the power channel never mentions temperature.
+        for fault in [
+            SampleFault::Missing,
+            SampleFault::Invalid,
+            SampleFault::Stale,
+        ] {
+            assert_ne!(
+                fault.code(SafetyChannel::Power),
+                fault.code(SafetyChannel::GpuTemp)
+            );
+            assert_eq!(fault.assessment(SafetyChannel::Power).kind, fault.kind());
+        }
     }
 
     #[test]
