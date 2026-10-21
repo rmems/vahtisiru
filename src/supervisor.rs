@@ -17,7 +17,7 @@ use tokio::task::JoinHandle;
 use crate::cpu::{self, RelayMetrics};
 use crate::gpu::HardwareBridge;
 use crate::nvml_gate::{NvmlGate, NvmlRunError};
-use crate::publish::{SensoryPublisher, evaluate_then_try_publish};
+use crate::publish::{SensoryPublisher, evaluate_then_try_publish, try_publish_isolated};
 use crate::safety::{
     ActuatorError, ActuatorOutcome, BRAKE_FRACTION, BrakeIntent, PowerLimitObservation,
     SafetyActuator, SafetyMachine, SafetySnapshot, SafetyState, classify_power_limit,
@@ -280,7 +280,8 @@ impl Supervisor {
         if !should_evaluate_tick(step_count, telemetry.source) {
             // Publication is outside the safety critical path and never awaited.
             // Same mapping-time basis as evaluate_then_try_publish.
-            let _ = self.publisher.try_publish(&telemetry.to_sensory_mapping());
+            // Panic-isolated like the evaluation path (GH#42).
+            let _ = try_publish_isolated(self.publisher.as_ref(), &telemetry.to_sensory_mapping());
             return false;
         }
         let prior_intent = self.machine.snapshot().intent;
@@ -881,6 +882,25 @@ mod tests {
             (first, dropped, healthy, second, sup.machine.trips_total()),
             (critical, None, None, critical, 2)
         );
+    }
+
+    struct PanickingPublisher;
+
+    impl SensoryPublisher for PanickingPublisher {
+        fn try_publish(&self, _mapping: &SensoryMapping) -> Result<(), PublishError> {
+            panic!("publisher bug");
+        }
+    }
+
+    #[tokio::test]
+    async fn panicking_publisher_on_a_non_evaluation_tick_does_not_unwind_step() {
+        let mut sup = harness()
+            .frames([fixtures::healthy_real(), fixtures::healthy_real()])
+            .publisher(PanickingPublisher)
+            .build();
+        let _ = sup.step().await; // tick 1: evaluation tick
+        let _ = sup.step().await; // tick 2: publish-only tick
+        assert_eq!(sup.machine.snapshot().intent, BrakeIntent::None);
     }
 
     #[tokio::test]

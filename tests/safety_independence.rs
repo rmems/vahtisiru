@@ -900,8 +900,6 @@ fn healthy_frame_while_apply_in_flight_does_not_reopen_the_episode() {
     );
 }
 
-/// A failed apply leaves nothing in flight: once readings are healthy the
-/// episode closes, and a later critical reading is a new trip.
 /// Blocks review (PR #85, thread 4311678277): an Apply intent that was never
 /// dispatched (gate busy, then dropped once the intent changed) is not in
 /// flight and must not hold the episode open forever.
@@ -922,6 +920,8 @@ fn undispatched_apply_does_not_swallow_the_next_trip() {
     assert_eq!(desired, [true, false, false, false, true]);
 }
 
+/// A failed apply leaves nothing in flight: once readings are healthy the
+/// episode closes, and a later critical reading is a new trip.
 #[test]
 fn failed_apply_then_healthy_closes_the_episode() {
     let mut m = machine();
