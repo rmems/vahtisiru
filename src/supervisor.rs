@@ -368,7 +368,14 @@ impl Supervisor {
             | DispatchResult::AlreadyInFlight
             | DispatchResult::NoIntent => None,
         };
-        result == DispatchResult::Spawned
+        let spawned = result == DispatchResult::Spawned;
+        // An apply is in flight only once a worker was actually spawned for
+        // it (GH#42); a parked-then-dropped Apply never holds the trip
+        // episode open.
+        if spawned && snap.intent == BrakeIntent::Apply {
+            self.machine.apply_dispatched();
+        }
+        spawned
     }
 
     /// Fail-closed orderly shutdown: never issues a new power-limit restore;
@@ -695,7 +702,7 @@ mod tests {
     use super::*;
     use crate::gpu::{GpuTarget, NvmlActuator};
     use crate::publish::{AbsentPublisher, IsolatedPublishQueue, PublishError};
-    use crate::safety::FakeActuator;
+    use crate::safety::{FakeActuator, SafetyReason};
     use crate::telemetry::{SensoryMapping, assess, fixtures, unix_now_ms};
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -825,6 +832,55 @@ mod tests {
         assert_eq!((spawned, sup.pending_intent), (true, None));
         let applied = sup.brake_task.take().unwrap().await.unwrap();
         assert_eq!((applied, fake.apply_calls()), (Ok(()), 1));
+    }
+
+    fn temp_frame(temp_c: f32) -> TelemetryFrame {
+        let mut raw = fixtures::healthy_real();
+        raw.gpu_temp_c = Some(temp_c);
+        assess(&raw, fixtures::NOW)
+    }
+
+    /// Evaluate one frame, dispatch, and return the frame's trip reason.
+    fn step_trip(sup: &mut Supervisor, temp_c: f32, due: bool) -> Option<SafetyReason> {
+        let snap = sup.machine.evaluate(&temp_frame(temp_c));
+        sup.dispatch_due_or_pending(due);
+        snap.trip
+    }
+
+    #[tokio::test]
+    async fn spawned_apply_holds_the_trip_episode_open_until_its_outcome() {
+        let fake = Arc::new(FakeActuator::new());
+        let mut sup = harness().actuator(fake.clone()).build();
+        let critical = Some(SafetyReason::ThermalCritical);
+        let first = step_trip(&mut sup, 90.0, true); // Apply spawned, no outcome yet
+        let healthy = step_trip(&mut sup, 60.0, false);
+        let again = step_trip(&mut sup, 90.0, true); // same episode: no new trip
+        assert!(sup.brake_task.is_some(), "the apply really was spawned");
+        assert_eq!(
+            (first, healthy, again, sup.machine.trips_total()),
+            (critical, None, None, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_busy_then_dropped_apply_leaves_trip_episode_closable() {
+        let fake = Arc::new(FakeActuator::new());
+        let mut sup = harness().actuator(fake.clone()).build();
+        let permit = sup.gate.try_enter().unwrap();
+        let critical = Some(SafetyReason::ThermalCritical);
+        let first = step_trip(&mut sup, 90.0, true); // gate busy: Apply parked
+        let dropped = step_trip(&mut sup, 60.0, false); // pending Apply dropped
+        drop(permit);
+        let healthy = step_trip(&mut sup, 60.0, false);
+        let second = step_trip(&mut sup, 90.0, true); // gate free: Apply spawned
+        assert!(
+            sup.brake_task.is_some(),
+            "the second apply really was spawned"
+        );
+        assert_eq!(
+            (first, dropped, healthy, second, sup.machine.trips_total()),
+            (critical, None, None, critical, 2)
+        );
     }
 
     #[tokio::test]
