@@ -141,7 +141,16 @@ locks the remaining edges and adds an integration harness under `tests/`.
   `IpcMessage` tests (`stimulus_batch_round_trips_through_published_corpus_ipc_types`,
   `software_only_emits_typed_corpus_ipc_frame_without_gpu`). `AbsentPublisher`
   remains the disabled or unavailable fallback.
-- The `main` async supervisor loop body (post-brake re-read, every-10-ticks cadence) is still exercised by the software-only binary smoke plus `evaluate_then_try_publish` / orderly-shutdown tests, not a full in-process tick harness.
+- The supervisor loop body (post-brake re-read, every-10-ticks cadence, gate-parked
+  intents, orderly shutdown) now lives in `src/supervisor.rs` as `Supervisor::step`
+  with the actuator, publisher, telemetry acquirer, and clock injected (RM-1459).
+  `cargo test --lib supervisor` runs the fault table in-process without a GPU,
+  `sudo`, or `nvidia-smi`: hung NVML acquire (tick and post-actuation re-read),
+  `sudo -n` denied on apply, release failure, apply in flight while telemetry
+  turns healthy (no overlapping release), panicking actuator worker, slow
+  sensory consumer, and `--force-software-only` with a leftover real brake.
+  `daemon.rs` keeps only CLI, lockfile, Prometheus bind, NVML target resolution,
+  and signal handling.
 
 ## Coverage update (RM-342)
 
@@ -154,7 +163,7 @@ locks the remaining edges and adds an integration harness under `tests/`.
 
 - `cpu::init_telemetry` / `cpu::run_metrics_collector`: bind a network port and run an indefinite loop; not safely unit-testable without an integration harness.
 - `NvmlActuator` (`apply_emergency_brake` / `release_emergency_brake` / `detect_engaged_brake`, GH#46): the NVML/`nvidia-smi` backend requires a real NVML-capable GPU and can mutate board power limits, so its hardware path is intentionally not exercised in software-only CI. It fails closed with a typed `ActuatorError` when NVML is unavailable (regression-tested), and the brake/release *policy* it serves is unit-tested via `SafetyMachine` plus the in-memory `safety::FakeActuator`.
-- The `main` async supervisor loop: covered by manual run instructions and end-to-end smoke tests rather than unit tests. Dashboard reading formatting is unit-tested. Hysteresis and IPC isolation are unit-tested via `SafetyMachine` / `evaluate_then_try_publish` without driving `main`, and the actuation boundary is exercised through the `SafetyActuator` trait with `FakeActuator`.
+- The `main` async supervisor loop: at the time covered only by manual run instructions and end-to-end smoke tests. Since RM-1459 the loop body is `Supervisor::step` in `src/supervisor.rs` and is unit-tested with injected doubles (see the RM-1217 coverage note above); only the signal `select!` and the tick sleep remain in `daemon::run`.
 
 ## Linting
 
