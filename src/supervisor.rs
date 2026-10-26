@@ -377,6 +377,9 @@ impl Supervisor {
         self.store_safety(&snap);
         let raw = self.acquire_raw_with_timeout().await;
         let frame = self.assess(&raw);
+        // This reassessment is a real evaluation: restart the deadline so the
+        // next tick cannot count a second Ok immediately.
+        self.last_eval_ms = Some((self.monotonic)());
         let (snap, pub_res) =
             evaluate_then_try_publish(&mut self.machine, &frame, self.publisher.as_ref());
         let _ = pub_res;

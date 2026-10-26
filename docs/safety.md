@@ -92,8 +92,8 @@ worst fault wins: **missing > invalid > stale**. Equal rank prefers
    (the restored default PL is not left in a still-hot/warn band).
 4. Release requires the configured real `Ok` streak
    (`SafetyPolicyConfig.release_ok_streak`, default **3**) while the brake is
-   engaged (~3 s at the default streak: three evaluations one
-   `SAFETY_EVAL_CADENCE_MS` = 1 s apart).
+   engaged (three evaluations one `SAFETY_EVAL_CADENCE_MS` = 1 s apart,
+   so ≈2 s after the first Ok evaluation at the default streak).
 5. Simulated telemetry while braked holds the brake and resets the Ok streak.
 6. Actuator failure does not freeze evaluation: the next frame still
    classifies and the intent is retried.
