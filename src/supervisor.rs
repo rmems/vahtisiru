@@ -247,8 +247,10 @@ impl Supervisor {
         let cadence_due = self
             .last_eval_ms
             .is_none_or(|last| now_ms.saturating_sub(last) >= self.config.eval_interval_ms);
-        let dispatch_due =
-            succeeded || self.evaluate_or_publish(cadence_due, now_ms, &telemetry, failed);
+        if cadence_due {
+            self.last_eval_ms = Some(now_ms);
+        }
+        let dispatch_due = succeeded || self.evaluate_or_publish(cadence_due, &telemetry, failed);
         self.supersede_release_if_apply();
         dispatched |= self.dispatch_due_or_pending(dispatch_due);
 
@@ -315,7 +317,6 @@ impl Supervisor {
     fn evaluate_or_publish(
         &mut self,
         cadence_due: bool,
-        now_ms: u64,
         telemetry: &TelemetryFrame,
         actuation_failed_this_tick: bool,
     ) -> bool {
@@ -326,7 +327,6 @@ impl Supervisor {
             let _ = try_publish_isolated(self.publisher.as_ref(), &telemetry.to_sensory_mapping());
             return false;
         }
-        self.last_eval_ms = Some(now_ms);
         let prior_intent = self.machine.snapshot().intent;
         let (snap, pub_res) =
             evaluate_then_try_publish(&mut self.machine, telemetry, self.publisher.as_ref());
@@ -396,10 +396,11 @@ impl Supervisor {
     /// success is recorded as `Released`, which clears `brake_engaged` and
     /// makes the reassessment in the same step re-apply immediately.
     fn supersede_release_if_apply(&mut self) {
-        if self.release_task.is_some()
-            && self.machine.snapshot().desired_brake
-            && !self.release_superseded.swap(true, Ordering::AcqRel)
-        {
+        let wants_brake = self.machine.snapshot().desired_brake;
+        if !(self.release_task.is_some() && wants_brake) {
+            return;
+        }
+        if !self.release_superseded.swap(true, Ordering::AcqRel) {
             tracing::warn!("brake desired while release in flight; superseding release");
         }
     }
