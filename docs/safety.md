@@ -92,15 +92,32 @@ worst fault wins: **missing > invalid > stale**. Equal rank prefers
    (the restored default PL is not left in a still-hot/warn band).
 4. Release requires the configured real `Ok` streak
    (`SafetyPolicyConfig.release_ok_streak`, default **3**) while the brake is
-   engaged (~3 s at the default streak and 100 ms tick × every 10 ticks).
+   engaged (~3 s at the default streak: three evaluations one
+   `SAFETY_EVAL_CADENCE_MS` = 1 s apart).
 5. Simulated telemetry while braked holds the brake and resets the Ok streak.
 6. Actuator failure does not freeze evaluation: the next frame still
    classifies and the intent is retried.
 
-The supervisor evaluates the first acquired frame immediately, then on
-the safety cadence (every 10 ticks) and again after an actuator task
-completes, using a fresh frame. Failed apply/release is recorded and retried
-on that cadence rather than every tick. `SafetyMachine::evaluate`
+The supervisor evaluates the first acquired frame immediately, then whenever
+`SAFETY_EVAL_CADENCE_MS` (1 s) of **monotonic** time has elapsed since the last
+evaluation — a wall-clock deadline, not a tick count, so `--step-interval-ms`,
+slow acquires and slow health checks do not stretch it. An unavailable NVML
+frame is evaluated on every tick, and every completed actuator task triggers a
+fresh-frame reassessment. Failed apply/release is recorded and retried on the
+deadline rather than every tick.
+
+If policy wants the brake (`desired_brake`) while a **Release** is in flight,
+the release is flagged superseded: a worker that has not yet reached the driver
+skips it. A call already inside `nvidia-smi -pl` cannot be interrupted, so it
+completes (bounded by the 5 s + 2 s `timeout -k`), is recorded honestly as
+`Released`, and Apply is dispatched in that same step.
+
+Bounds (default 100 ms tick, 1 s deadline): detect-to-brake dispatch is at most
+one eval period (1 s) plus one tick plus acquire time (≤ 2 s `NVML_TIMEOUT`);
+the full-power window when a Release was already in flight is at most the
+remainder of that release's actuation timeout (≤ 7 s) plus one tick, never
+extended by the eval cadence. `SAFETY_STALE_AFTER_MS` (2 s) stays an
+independent fail-closed bound on sample age. `SafetyMachine::evaluate`
 never publishes and never calls `nvidia-smi`. Pre-telemetry snapshots are
 not dispatched as hardware commands: `--force-software-only` must be
 classified first (hold, do not apply).
@@ -158,8 +175,8 @@ the variants without a policy cannot authorize healthy real telemetry.
 
 Sample age can be tightened below 2000 ms, and the declared acquisition interval
 is bounded (100 ms by default). Age is measured at the frame assessment time;
-reassess held frames before evaluation. The daemon rejects configured ten-tick
-intervals exceeding the sample-age limit. Actual scheduling and sensor reads
+reassess held frames before evaluation. The daemon rejects a step
+interval exceeding the acquisition or sample-age limit. Actual scheduling and sensor reads
 add elapsed time, so this is not a hard real-time response guarantee. The full
 CLI/environment option table and valid ranges are in the README.
 

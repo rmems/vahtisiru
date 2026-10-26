@@ -10,6 +10,7 @@
 //! braked) runs without a GPU, `sudo`, or `nvidia-smi` (RM-1459).
 
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::task::JoinHandle;
@@ -54,12 +55,24 @@ impl TelemetryAcquirer for HardwareBridge {
 /// Wall-clock source for frame receive timestamps (injectable in tests).
 pub(crate) type Clock = Arc<dyn Fn() -> UnixMillis + Send + Sync>;
 
+/// Monotonic millisecond source for the safety-evaluation deadline
+/// (injectable in tests; never wall-clock, so NTP steps cannot skip or stall it).
+pub(crate) type MonotonicClock = Arc<dyn Fn() -> u64 + Send + Sync>;
+
+/// Production monotonic clock: milliseconds since first call.
+pub(crate) fn monotonic_ms_clock() -> MonotonicClock {
+    let start = std::time::Instant::now();
+    Arc::new(move || u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX))
+}
+
 /// Static supervisor settings derived from the CLI.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SupervisorConfig {
     pub force_software_only: bool,
     /// Declared acquisition cadence (ms); drives stale-after thresholds.
     pub cadence_ms: u64,
+    /// Wall-clock safety-evaluation period (ms), independent of tick length.
+    pub eval_interval_ms: u64,
     /// Bound on each gated NVML wait.
     pub nvml_timeout: Duration,
     /// Print the live dashboard line to stdout each step.
@@ -75,6 +88,7 @@ pub(crate) struct SupervisorParts {
     pub acquirer: Arc<dyn TelemetryAcquirer>,
     pub gate: NvmlGate,
     pub clock: Clock,
+    pub monotonic: MonotonicClock,
     pub relay_metrics: Arc<Mutex<RelayMetrics>>,
 }
 
@@ -95,6 +109,9 @@ pub(crate) struct StepReport {
     pub pending_intent: Option<BrakeIntent>,
 }
 
+/// Sentinel for a release preempted before it reached the driver.
+const RELEASE_SKIPPED: &str = "release superseded before start";
+
 /// Handle to an in-flight privileged actuation attempt.
 type ActuationTask = JoinHandle<Result<(), ActuatorError>>;
 
@@ -108,6 +125,7 @@ pub(crate) struct Supervisor {
     acquirer: Arc<dyn TelemetryAcquirer>,
     gate: NvmlGate,
     clock: Clock,
+    monotonic: MonotonicClock,
     relay_metrics: Arc<Mutex<RelayMetrics>>,
     warned_brake_held_sim: bool,
     warned_nvml_busy: bool,
@@ -115,6 +133,10 @@ pub(crate) struct Supervisor {
     release_task: Option<ActuationTask>,
     pending_intent: Option<BrakeIntent>,
     step_count: u64,
+    last_eval_ms: Option<u64>,
+    /// Set when Apply became the intent while a Release was in flight: the
+    /// release is discarded (never recorded) and not started if still queued.
+    release_superseded: Arc<AtomicBool>,
 }
 
 impl Supervisor {
@@ -128,6 +150,7 @@ impl Supervisor {
             acquirer: parts.acquirer,
             gate: parts.gate,
             clock: parts.clock,
+            monotonic: parts.monotonic,
             relay_metrics: parts.relay_metrics,
             warned_brake_held_sim: false,
             warned_nvml_busy: false,
@@ -135,6 +158,8 @@ impl Supervisor {
             release_task: None,
             pending_intent: None,
             step_count: 0,
+            last_eval_ms: None,
+            release_superseded: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -218,7 +243,13 @@ impl Supervisor {
         let succeeded = actuation.as_ref().is_some_and(outcome_succeeded);
         let failed = actuation.is_some() && !succeeded;
 
-        let dispatch_due = succeeded || self.evaluate_or_publish(step_count, &telemetry, failed);
+        let now_ms = (self.monotonic)();
+        let cadence_due = self
+            .last_eval_ms
+            .is_none_or(|last| now_ms.saturating_sub(last) >= self.config.eval_interval_ms);
+        let dispatch_due =
+            succeeded || self.evaluate_or_publish(cadence_due, now_ms, &telemetry, failed);
+        self.supersede_release_if_apply();
         dispatched |= self.dispatch_due_or_pending(dispatch_due);
 
         {
@@ -254,7 +285,16 @@ impl Supervisor {
             return None;
         }
         let task = slot.take().expect("finished task exists");
-        let outcome = actuation_outcome(kind, task.await);
+        let joined = task.await;
+        if kind == ActuationKind::Release {
+            self.release_superseded.store(false, Ordering::Release);
+            if matches!(&joined, Ok(Err(ActuatorError::CommandFailed(m))) if m == RELEASE_SKIPPED) {
+                // Never reached the driver: nothing changed, nothing to record.
+                // The brake stays engaged and policy decides the next intent.
+                return None;
+            }
+        }
+        let outcome = actuation_outcome(kind, joined);
         if outcome_succeeded(&outcome) {
             self.reassess_after_actuation(outcome.clone()).await;
         } else {
@@ -268,29 +308,32 @@ impl Supervisor {
     /// Returns whether the resulting intent is due for dispatch.
     ///
     /// The first acquired frame is evaluated immediately (fail-closed
-    /// startup); later evaluations keep the every-10-ticks cadence. Never
+    /// startup); later evaluations fire once `eval_interval_ms` of monotonic
+    /// time has elapsed, regardless of tick length or acquire latency. Never
     /// spawn from the pre-telemetry snapshot: SoftwareFallback holds rather
     /// than applies, which only `classify_frame` can decide.
     fn evaluate_or_publish(
         &mut self,
-        step_count: u64,
+        cadence_due: bool,
+        now_ms: u64,
         telemetry: &TelemetryFrame,
         actuation_failed_this_tick: bool,
     ) -> bool {
-        if !should_evaluate_tick(step_count, telemetry.source) {
+        if !should_evaluate_tick(cadence_due, telemetry.source) {
             // Publication is outside the safety critical path and never awaited.
             // Same mapping-time basis as evaluate_then_try_publish.
             // Panic-isolated like the evaluation path (GH#42).
             let _ = try_publish_isolated(self.publisher.as_ref(), &telemetry.to_sensory_mapping());
             return false;
         }
+        self.last_eval_ms = Some(now_ms);
         let prior_intent = self.machine.snapshot().intent;
         let (snap, pub_res) =
             evaluate_then_try_publish(&mut self.machine, telemetry, self.publisher.as_ref());
         let _ = pub_res;
         self.store_safety(&snap);
         should_dispatch_intent(
-            step_count,
+            cadence_due,
             prior_intent,
             snap.intent,
             actuation_failed_this_tick,
@@ -346,6 +389,21 @@ impl Supervisor {
         cpu::record_safety_snapshot(&mut metrics, snap);
     }
 
+    /// Policy wants the brake while a `Release` is still in flight (the
+    /// machine still counts the brake engaged, so its intent is not `Apply`
+    /// yet). Flag the release so a worker that has not reached the driver
+    /// skips it. A call already inside `nvidia-smi` cannot be interrupted; its
+    /// success is recorded as `Released`, which clears `brake_engaged` and
+    /// makes the reassessment in the same step re-apply immediately.
+    fn supersede_release_if_apply(&mut self) {
+        if self.release_task.is_some()
+            && self.machine.snapshot().desired_brake
+            && !self.release_superseded.swap(true, Ordering::AcqRel)
+        {
+            tracing::warn!("brake desired while release in flight; superseding release");
+        }
+    }
+
     /// Retry only intents skipped because another NVML worker held the gate.
     /// Reconcile with the latest safety snapshot before any retry.
     /// Returns whether a worker was spawned.
@@ -362,6 +420,7 @@ impl Supervisor {
             &self.actuator,
             &self.gate,
             (&mut self.brake_task, &mut self.release_task),
+            &self.release_superseded,
         );
         self.pending_intent = match result {
             DispatchResult::GateBusy => Some(snap.intent),
@@ -537,12 +596,12 @@ fn log_shutdown_plan(snap: &SafetySnapshot, in_flight: InFlightActuation, plan: 
     );
 }
 
-fn should_evaluate_tick(step_count: u64, source: TelemetrySource) -> bool {
-    step_count == 1 || step_count.is_multiple_of(10) || source == TelemetrySource::NvmlUnavailable
+fn should_evaluate_tick(cadence_due: bool, source: TelemetrySource) -> bool {
+    cadence_due || source == TelemetrySource::NvmlUnavailable
 }
 
 fn should_dispatch_intent(
-    step_count: u64,
+    cadence_due: bool,
     prior: BrakeIntent,
     current: BrakeIntent,
     actuation_failed_this_tick: bool,
@@ -553,7 +612,7 @@ fn should_dispatch_intent(
     if current != prior {
         return true;
     }
-    !actuation_failed_this_tick && (step_count == 1 || step_count.is_multiple_of(10))
+    !actuation_failed_this_tick && cadence_due
 }
 
 fn should_log_acquisition_error(warned_busy: &mut bool, error: Option<&NvmlRunError>) -> bool {
@@ -645,6 +704,7 @@ fn spawn_intent(
     actuator: &Arc<dyn SafetyActuator>,
     gate: &NvmlGate,
     slots: (&mut Option<ActuationTask>, &mut Option<ActuationTask>),
+    release_superseded: &Arc<AtomicBool>,
 ) -> DispatchResult {
     let (brake_task, release_task) = slots;
     if brake_task.is_some() || release_task.is_some() {
@@ -662,10 +722,17 @@ fn spawn_intent(
     };
     let actuator = Arc::clone(actuator);
     let intent = snap.intent;
+    let superseded = Arc::clone(release_superseded);
+    if intent == BrakeIntent::Release {
+        superseded.store(false, Ordering::Release);
+    }
     *slot = Some(tokio::task::spawn_blocking(move || {
         let _permit = permit;
         match intent {
             BrakeIntent::Apply => actuator.apply_emergency_brake(BRAKE_FRACTION),
+            BrakeIntent::Release if superseded.load(Ordering::Acquire) => {
+                Err(ActuatorError::CommandFailed(RELEASE_SKIPPED.into()))
+            }
             BrakeIntent::Release => actuator.release_emergency_brake(),
             BrakeIntent::None => unreachable!("only actuation intents acquire a slot"),
         }
@@ -706,7 +773,7 @@ mod tests {
     use crate::safety::{FakeActuator, SafetyReason};
     use crate::telemetry::{SensoryMapping, assess, fixtures, unix_now_ms};
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicU64;
     use std::sync::mpsc;
     use std::time::Instant;
 
@@ -714,27 +781,30 @@ mod tests {
 
     #[test]
     fn unavailable_tick_is_evaluated_without_waiting_for_tenth_tick() {
-        assert!(should_evaluate_tick(11, TelemetrySource::NvmlUnavailable));
-        assert!(!should_evaluate_tick(11, TelemetrySource::Nvml));
-        assert!(should_evaluate_tick(10, TelemetrySource::Nvml));
+        assert!(should_evaluate_tick(
+            false,
+            TelemetrySource::NvmlUnavailable
+        ));
+        assert!(!should_evaluate_tick(false, TelemetrySource::Nvml));
+        assert!(should_evaluate_tick(true, TelemetrySource::Nvml));
     }
 
     #[test]
     fn unchanged_brake_intent_retries_only_on_safety_cadence() {
         assert!(should_dispatch_intent(
-            11,
+            false,
             BrakeIntent::None,
             BrakeIntent::Apply,
             false,
         ));
         assert!(!should_dispatch_intent(
-            11,
+            false,
             BrakeIntent::Apply,
             BrakeIntent::Apply,
             false,
         ));
         assert!(should_dispatch_intent(
-            20,
+            true,
             BrakeIntent::Apply,
             BrakeIntent::Apply,
             false,
@@ -744,19 +814,19 @@ mod tests {
     #[test]
     fn failed_actuation_does_not_retry_again_on_its_completion_tick() {
         assert!(!should_dispatch_intent(
-            20,
+            true,
             BrakeIntent::Apply,
             BrakeIntent::Apply,
             true,
         ));
         assert!(should_dispatch_intent(
-            30,
+            true,
             BrakeIntent::Apply,
             BrakeIntent::Apply,
             false,
         ));
         assert!(should_dispatch_intent(
-            20,
+            true,
             BrakeIntent::Release,
             BrakeIntent::Apply,
             true,
@@ -802,6 +872,7 @@ mod tests {
             &actuator,
             &gate,
             (&mut brake_task, &mut release_task),
+            &Arc::new(AtomicBool::new(false)),
         );
         assert!(brake_task.is_none());
         assert!(release_task.is_none());
@@ -1104,6 +1175,8 @@ mod tests {
         block_apply: Mutex<Option<mpsc::Receiver<()>>>,
         apply_entered: Mutex<Option<mpsc::Sender<()>>>,
         panic_apply: Mutex<bool>,
+        block_release: Mutex<Option<mpsc::Receiver<()>>>,
+        release_entered: Mutex<Option<mpsc::Sender<()>>>,
     }
 
     impl ControlledActuator {
@@ -1113,6 +1186,8 @@ mod tests {
                 block_apply: Mutex::new(None),
                 apply_entered: Mutex::new(None),
                 panic_apply: Mutex::new(false),
+                block_release: Mutex::new(None),
+                release_entered: Mutex::new(None),
             }
         }
 
@@ -1121,6 +1196,14 @@ mod tests {
             let (entered_tx, entered_rx) = mpsc::channel();
             *self.block_apply.lock().unwrap() = Some(release_rx);
             *self.apply_entered.lock().unwrap() = Some(entered_tx);
+            (release_tx, entered_rx)
+        }
+
+        fn block_next_release(&self) -> (mpsc::Sender<()>, mpsc::Receiver<()>) {
+            let (release_tx, release_rx) = mpsc::channel();
+            let (entered_tx, entered_rx) = mpsc::channel();
+            *self.block_release.lock().unwrap() = Some(release_rx);
+            *self.release_entered.lock().unwrap() = Some(entered_tx);
             (release_tx, entered_rx)
         }
 
@@ -1144,6 +1227,13 @@ mod tests {
             self.inner.apply_emergency_brake(pct)
         }
         fn release_emergency_brake(&self) -> Result<(), ActuatorError> {
+            let block = self.block_release.lock().unwrap().take();
+            if let Some(rx) = block {
+                if let Some(tx) = self.release_entered.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                let _ = rx.recv();
+            }
             self.inner.release_emergency_brake()
         }
         fn query_power_limits_w(&self) -> (Option<u32>, Option<u32>) {
@@ -1219,6 +1309,7 @@ mod tests {
                 SupervisorConfig {
                     force_software_only: self.software_only,
                     cadence_ms: 100,
+                    eval_interval_ms: 1_000,
                     nvml_timeout: FAST_TIMEOUT,
                     dashboard: false,
                 },
@@ -1234,6 +1325,11 @@ mod tests {
                         .unwrap_or_else(|| Arc::new(ScriptedAcquirer::new([]))),
                     gate: NvmlGate::default(),
                     clock,
+                    // Each step reads the clock once and advances one 100 ms tick.
+                    monotonic: {
+                        let ms = Arc::new(AtomicU64::new(0));
+                        Arc::new(move || ms.fetch_add(100, Ordering::SeqCst))
+                    },
                     relay_metrics: Arc::new(Mutex::new(RelayMetrics::default())),
                 },
             )
@@ -1523,9 +1619,10 @@ mod tests {
             (hw_is(false, 1, 0), 1, S::ActuatorFailure)
         );
 
-        // Retried at the 10-tick cadence, and still denied.
+        // Retried when the next 1 s eval deadline elapses (11th 100 ms tick
+        // after the first evaluation), and still denied.
         let report = step_until(&mut sup, 12, |r| r.dispatched).await;
-        assert_eq!(report.step, 10);
+        assert_eq!(report.step, 11);
         settle(&sup).await;
         let report = step_until(&mut sup, 5, |r| r.actuation.is_some()).await;
         assert_eq!(
@@ -1564,11 +1661,11 @@ mod tests {
         let seeded = sup.snapshot();
         assert_eq!((seeded.brake_engaged, seeded.state), (true, S::Recovering));
 
-        // Evaluations happen at steps 1, 10, 20 → streak of 3 → Release.
+        // Evaluations happen at steps 1, 11, 21 → streak of 3 → Release.
         let report = step_until(&mut sup, 25, |r| r.dispatched).await;
         assert_eq!(
             (report.step, tick(&report)),
-            (20, dispatching(S::Recovering, I::Release, true))
+            (21, dispatching(S::Recovering, I::Release, true))
         );
         settle(&sup).await;
 
@@ -1843,5 +1940,87 @@ mod tests {
             )
         );
         assert_eq!((reason, exported_brake), (Some("sigint"), true));
+    }
+
+    // ---- RM-1476: wall-clock eval deadline + release preemption ----
+
+    /// A tick far longer than the eval interval (slow acquire / large
+    /// `--step-interval-ms`) still evaluates every step, so a Critical frame
+    /// on step 2 trips on step 2 rather than on the 10th tick.
+    #[tokio::test]
+    async fn slow_ticks_evaluate_every_step_not_every_tenth() {
+        let fake = Arc::new(FakeActuator::new());
+        let mut sup = harness()
+            .actuator(fake.clone())
+            .frames([fixtures::healthy_real(), critical_temp()])
+            .build();
+        sup.monotonic = Arc::new({
+            let ms = AtomicU64::new(0);
+            move || ms.fetch_add(1_000, Ordering::SeqCst)
+        });
+        let first = sup.step().await;
+        assert_eq!(first.snapshot.intent, I::None);
+        let second = sup.step().await;
+        assert_eq!(
+            (second.step, second.snapshot.intent, second.dispatched),
+            (2, I::Apply, true)
+        );
+    }
+
+    /// Sub-deadline ticks must not evaluate; the deadline is wall-clock.
+    #[tokio::test]
+    async fn fast_ticks_wait_for_the_deadline() {
+        let mut sup = harness()
+            .frames([fixtures::healthy_real(), critical_temp()])
+            .build();
+        sup.monotonic = Arc::new({
+            let ms = AtomicU64::new(0);
+            move || ms.fetch_add(100, Ordering::SeqCst)
+        });
+        let _ = sup.step().await;
+        let second = sup.step().await; // 100 ms later: publish only
+        assert_eq!(second.snapshot.intent, I::None);
+    }
+
+    /// A release held in flight while Critical arrives: the policy flags it
+    /// superseded, and the instant it completes the restore is recorded
+    /// honestly and Apply is dispatched in the *same* step (no cadence wait,
+    /// no second release).
+    #[tokio::test]
+    async fn critical_during_in_flight_release_reapplies_on_completion() {
+        let fake = Arc::new(FakeActuator::new());
+        fake.apply_emergency_brake(BRAKE_FRACTION).unwrap();
+        let ctl = Arc::new(ControlledActuator::new(Arc::clone(&fake)));
+        let (unblock, entered) = ctl.block_next_release();
+        let mut sup = harness()
+            .actuator(ctl)
+            .frames([fixtures::healthy_real()])
+            .build();
+        sup.seed_startup_brake(Some(200), Some(400));
+        sup.monotonic = Arc::new({
+            let ms = AtomicU64::new(0);
+            move || ms.fetch_add(1_000, Ordering::SeqCst)
+        });
+        let _ = step_until(&mut sup, 10, |r| r.dispatched).await;
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(sup.release_task.is_some());
+
+        sup.acquirer = Arc::new(ScriptedAcquirer::new([critical_temp()]));
+        let _ = sup.step().await;
+        assert!(sup.release_superseded.load(Ordering::Acquire));
+        assert_eq!(fake.release_calls(), 0, "release still held, not restored");
+
+        unblock.send(()).unwrap();
+        settle(&sup).await;
+        let report = sup.step().await;
+        assert_eq!(report.actuation, Some(ActuatorOutcome::Released));
+        assert_eq!(
+            (report.snapshot.intent, report.dispatched),
+            (I::Apply, true)
+        );
+        settle(&sup).await;
+        let report = step_until(&mut sup, 5, |r| r.actuation.is_some()).await;
+        assert_eq!(report.actuation, Some(ActuatorOutcome::Applied));
+        assert_eq!(hw(&fake), hw_is(true, 2, 1));
     }
 }
