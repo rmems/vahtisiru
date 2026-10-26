@@ -59,7 +59,7 @@ pub(crate) type Clock = Arc<dyn Fn() -> UnixMillis + Send + Sync>;
 /// (injectable in tests; never wall-clock, so NTP steps cannot skip or stall it).
 pub(crate) type MonotonicClock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
-/// Production monotonic clock: milliseconds since first call.
+/// Production monotonic clock: milliseconds since the clock was built.
 pub(crate) fn monotonic_ms_clock() -> MonotonicClock {
     let start = std::time::Instant::now();
     Arc::new(move || u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX))
@@ -134,8 +134,8 @@ pub(crate) struct Supervisor {
     pending_intent: Option<BrakeIntent>,
     step_count: u64,
     last_eval_ms: Option<u64>,
-    /// Set when Apply became the intent while a Release was in flight: the
-    /// release is discarded (never recorded) and not started if still queued.
+    /// Set when policy wants the brake (`desired_brake`) while a Release is in
+    /// flight: a release not yet at the driver is skipped without being recorded.
     release_superseded: Arc<AtomicBool>,
 }
 
@@ -1986,12 +1986,12 @@ mod tests {
         assert_eq!(second.snapshot.intent, I::None);
     }
 
-    /// A release held in flight while Critical arrives: the policy flags it
+    /// A release held in flight (gate busy, so telemetry fail-closes): policy flags it
     /// superseded, and the instant it completes the restore is recorded
     /// honestly and Apply is dispatched in the *same* step (no cadence wait,
     /// no second release).
     #[tokio::test]
-    async fn critical_during_in_flight_release_reapplies_on_completion() {
+    async fn gate_busy_during_in_flight_release_reapplies_on_completion() {
         let fake = Arc::new(FakeActuator::new());
         fake.apply_emergency_brake(BRAKE_FRACTION).unwrap();
         let ctl = Arc::new(ControlledActuator::new(Arc::clone(&fake)));
@@ -2009,13 +2009,17 @@ mod tests {
         entered.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(sup.release_task.is_some());
 
-        sup.acquirer = Arc::new(ScriptedAcquirer::new([critical_temp()]));
-        let _ = sup.step().await;
+        // The held release owns the NVML gate, so the next read is Busy and
+        // fail-closes (NvmlUnavailable → brake desired).
+        let report = sup.step().await;
+        assert_eq!(report.source, TelemetrySource::NvmlUnavailable);
         assert!(sup.release_superseded.load(Ordering::Acquire));
         assert_eq!(fake.release_calls(), 0, "release still held, not restored");
 
         unblock.send(()).unwrap();
         settle(&sup).await;
+        // Gate is free again and telemetry is still critical.
+        sup.acquirer = Arc::new(ScriptedAcquirer::new([critical_temp()]));
         let report = sup.step().await;
         assert_eq!(report.actuation, Some(ActuatorOutcome::Released));
         assert_eq!(

@@ -102,7 +102,7 @@ The supervisor evaluates the first acquired frame immediately, then whenever
 `SAFETY_EVAL_CADENCE_MS` (1 s) of **monotonic** time has elapsed since the last
 evaluation — a wall-clock deadline, not a tick count, so `--step-interval-ms`,
 slow acquires and slow health checks do not stretch it. An unavailable NVML
-frame is evaluated on every tick, and every completed actuator task triggers a
+frame is evaluated on every tick, and every successful actuator task triggers a
 fresh-frame reassessment. Failed apply/release is recorded and retried on the
 deadline rather than every tick.
 
