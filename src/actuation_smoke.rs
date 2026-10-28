@@ -404,6 +404,53 @@ struct Smoke<'a, B: ActuationSmokeBackend> {
     out: &'a mut dyn Write,
 }
 
+/// Pure pre-state gate: the device must be at its default, owned by nobody.
+/// Returns `(current_w, default_w)` or the refusal reason.
+fn classify_pre_state(
+    current: Option<u32>,
+    default: Option<u32>,
+    uuid: &str,
+) -> Result<(u32, u32), String> {
+    match classify_power_limit(current, default, BRAKE_FRACTION) {
+        PowerLimitObservation::AtOrAboveDefault {
+            current_w,
+            default_w,
+        } => at_default(current_w, default_w),
+        PowerLimitObservation::Unreadable => {
+            Err("current/default power limit unreadable or brake target ambiguous".into())
+        }
+        PowerLimitObservation::RelayOwnedBrake(m) => Err(format!(
+            "a relay-owned brake is already engaged (current={} W, default={} W); recover with `{}` before re-running",
+            m.current_w,
+            m.default_w,
+            recovery_command(uuid, m.default_w)
+        )),
+        PowerLimitObservation::ForeignSubDefaultCap {
+            current_w,
+            default_w,
+            ..
+        } => Err(format!(
+            "foreign sub-default power cap (current={current_w} W, default={default_w} W); refusing to take ownership"
+        )),
+    }
+}
+
+/// An at-or-above-default reading is acceptable only when positive and within
+/// tolerance of the default. Release always restores *default*, so an operator
+/// limit raised above it would be silently lost; refuse rather than "restore"
+/// to a value the device did not start at.
+fn at_default(current_w: u32, default_w: u32) -> Result<(u32, u32), String> {
+    if current_w == 0 || default_w == 0 {
+        return Err("NVML reported a non-positive power limit".into());
+    }
+    if current_w.abs_diff(default_w) > BRAKE_MATCH_TOLERANCE_W {
+        return Err(format!(
+            "current limit {current_w} W is above the device default {default_w} W; release restores the default, which would discard that setting. Set the limit to the default before re-running"
+        ));
+    }
+    Ok((current_w, default_w))
+}
+
 impl<B: ActuationSmokeBackend> Smoke<'_, B> {
     fn limits(&self) -> (Option<u32>, Option<u32>) {
         self.backend.actuator().query_power_limits_w()
@@ -419,62 +466,8 @@ impl<B: ActuationSmokeBackend> Smoke<'_, B> {
             fmt_w(current),
             fmt_w(default)
         );
-        let (current_w, default_w) = match classify_power_limit(current, default, BRAKE_FRACTION) {
-            PowerLimitObservation::AtOrAboveDefault {
-                current_w,
-                default_w,
-            } if current_w > 0
-                && default_w > 0
-                && current_w.abs_diff(default_w) <= BRAKE_MATCH_TOLERANCE_W =>
-            {
-                (current_w, default_w)
-            }
-            PowerLimitObservation::AtOrAboveDefault {
-                current_w,
-                default_w,
-            } => {
-                // Release always restores *default*; an operator limit raised
-                // above it would be silently lost, so refuse rather than
-                // "restore" to a value the device did not start at.
-                let reason = if current_w == 0 || default_w == 0 {
-                    "NVML reported a non-positive power limit".to_string()
-                } else {
-                    format!(
-                        "current limit {current_w} W is above the device default {default_w} W; release restores the default, which would discard that setting. Set the limit to the default before re-running"
-                    )
-                };
-                return Err(refuse(SmokeStage::PreState, reason));
-            }
-            PowerLimitObservation::Unreadable => {
-                return Err(refuse(
-                    SmokeStage::PreState,
-                    "current/default power limit unreadable or brake target ambiguous",
-                ));
-            }
-            PowerLimitObservation::RelayOwnedBrake(m) => {
-                return Err(refuse(
-                    SmokeStage::PreState,
-                    format!(
-                        "a relay-owned brake is already engaged (current={} W, default={} W); recover with `{}` before re-running",
-                        m.current_w,
-                        m.default_w,
-                        recovery_command(&self.uuid, m.default_w)
-                    ),
-                ));
-            }
-            PowerLimitObservation::ForeignSubDefaultCap {
-                current_w,
-                default_w,
-                ..
-            } => {
-                return Err(refuse(
-                    SmokeStage::PreState,
-                    format!(
-                        "foreign sub-default power cap (current={current_w} W, default={default_w} W); refusing to take ownership"
-                    ),
-                ));
-            }
-        };
+        let (current_w, default_w) = classify_pre_state(current, default, &self.uuid)
+            .map_err(|reason| refuse(SmokeStage::PreState, reason))?;
         let target_w = unambiguous_brake_target(default_w, BRAKE_FRACTION)
             .ok_or_else(|| refuse(SmokeStage::PreState, "brake target is ambiguous"))?;
         self.default_w = default_w;
