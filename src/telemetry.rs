@@ -174,7 +174,7 @@ pub const ALL_SIGNALS: [SignalId; 8] = [
 
 /// Default supervisor acquisition cadence (matches `--step-interval-ms` default).
 pub const DEFAULT_ACQUISITION_CADENCE_MS: u64 = 100;
-/// Safety evaluation cadence in the supervisor (every 10 ticks at default interval).
+/// Wall-clock safety evaluation period in the supervisor (monotonic deadline, independent of tick length).
 pub const SAFETY_EVAL_CADENCE_MS: u64 = 1_000;
 /// Stale threshold for safety-critical signals (2× safety cadence).
 pub const SAFETY_STALE_AFTER_MS: u64 = 2_000;

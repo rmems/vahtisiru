@@ -248,7 +248,7 @@ fn binary_rejects_cadence_that_exceeds_policy() {
         vec!["--step-interval-ms", "101"],
         vec![
             "--step-interval-ms",
-            "201",
+            "301",
             "--safety-max-acquisition-interval-ms",
             "300",
         ],

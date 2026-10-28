@@ -92,16 +92,36 @@ worst fault wins: **missing > invalid > stale**. Equal rank prefers
    (the restored default PL is not left in a still-hot/warn band).
 4. Release requires the configured real `Ok` streak
    (`SafetyPolicyConfig.release_ok_streak`, default **3**) while the brake is
-   engaged (~3 s at the default streak and 100 ms tick × every 10 ticks).
+   engaged (three evaluations one `SAFETY_EVAL_CADENCE_MS` = 1 s apart,
+   so ≈2 s after the first Ok evaluation at the default streak).
 5. Simulated telemetry while braked holds the brake and resets the Ok streak.
 6. Actuator failure does not freeze evaluation: the next frame still
    classifies and the intent is retried.
 
-The supervisor evaluates the first acquired frame immediately, then on
-the safety cadence (every 10 ticks) and again after an actuator task
-completes, using a fresh frame. Failed apply/release is recorded and retried
-on that cadence rather than every tick. `SafetyMachine::evaluate`
-never publishes and never calls `nvidia-smi`. Pre-telemetry snapshots are
+The supervisor evaluates the first acquired frame immediately, then whenever
+`SAFETY_EVAL_CADENCE_MS` (1 s) of **monotonic** time has elapsed since the last
+evaluation — a wall-clock deadline, not a tick count, so `--step-interval-ms`,
+slow acquires and slow health checks do not stretch it. An unavailable NVML
+frame is evaluated on every tick, and every successful actuator task triggers a
+fresh-frame reassessment. Failed apply/release is recorded and retried on the
+deadline rather than every tick.
+
+If policy wants the brake (`desired_brake`) while a **Release** is in flight,
+the release is flagged superseded: a worker that has not yet reached the driver
+skips it. A call already inside `nvidia-smi -pl` cannot be interrupted, so it
+completes (the actuation command is wrapped in `timeout -k 2 5s`), is recorded
+honestly as `Released`, and the supervisor then re-reads telemetry before it
+attempts Apply. That read can be slow, and a timed-out read keeps the NVML gate
+held, which leaves Apply pending until the gate frees.
+
+No end-to-end detect-to-brake or full-power-window bound is guaranteed. The
+evaluation deadline (1 s) bounds how often a frame is evaluated, not when the
+brake lands: a timed-out acquisition can hold the NVML gate after fail-closed
+evaluation requests Apply, a post-actuation read can delay Apply, and the
+release timeout does not bound the full-power window. `SAFETY_STALE_AFTER_MS`
+(2 s) stays an independent fail-closed bound on sample age.
+
+`SafetyMachine::evaluate` never publishes and never calls `nvidia-smi`. Pre-telemetry snapshots are
 not dispatched as hardware commands: `--force-software-only` must be
 classified first (hold, do not apply).
 
@@ -158,8 +178,8 @@ the variants without a policy cannot authorize healthy real telemetry.
 
 Sample age can be tightened below 2000 ms, and the declared acquisition interval
 is bounded (100 ms by default). Age is measured at the frame assessment time;
-reassess held frames before evaluation. The daemon rejects configured ten-tick
-intervals exceeding the sample-age limit. Actual scheduling and sensor reads
+reassess held frames before evaluation. The daemon rejects a step
+interval exceeding the acquisition or sample-age limit. Actual scheduling and sensor reads
 add elapsed time, so this is not a hard real-time response guarantee. The full
 CLI/environment option table and valid ranges are in the README.
 

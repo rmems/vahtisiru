@@ -27,9 +27,12 @@ use crate::safety::{
     instant_status_with_policy,
 };
 use crate::shutdown::ShutdownReason;
-use crate::supervisor::{NVML_TIMEOUT, Supervisor, SupervisorConfig, SupervisorParts};
+use crate::supervisor::{
+    NVML_TIMEOUT, Supervisor, SupervisorConfig, SupervisorParts, monotonic_ms_clock,
+};
 use crate::telemetry::{
-    SampleClock, SampleValidity, TelemetrySample, TelemetrySource, assess_with_clock, unix_now_ms,
+    SAFETY_EVAL_CADENCE_MS, SampleClock, SampleValidity, TelemetrySample, TelemetrySource,
+    assess_with_clock, unix_now_ms,
 };
 use tokio::signal::unix::{SignalKind, signal};
 
@@ -186,6 +189,24 @@ pub fn prepare() -> Result<SupervisorStart, Box<dyn std::error::Error>> {
     })
 }
 
+fn sample_clock_for(cli: &Cli) -> SampleClock {
+    if cli.ipc_session_id.is_empty() {
+        SampleClock::new()
+    } else {
+        SampleClock::with_session_id(cli.ipc_session_id.clone())
+    }
+}
+
+fn supervisor_config(cli: &Cli) -> SupervisorConfig {
+    SupervisorConfig {
+        force_software_only: cli.force_software_only,
+        cadence_ms: cli.step_interval_ms,
+        eval_interval_ms: SAFETY_EVAL_CADENCE_MS,
+        nvml_timeout: NVML_TIMEOUT,
+        dashboard: true,
+    }
+}
+
 /// Run the supervisor using a lock retained by the caller through runtime shutdown.
 /// This is executable plumbing, not a reusable library API.
 #[doc(hidden)]
@@ -253,26 +274,17 @@ pub async fn run(prepared: &mut SupervisorStart) -> Result<(), Box<dyn std::erro
         );
     }
 
-    let sample_clock = if cli.ipc_session_id.is_empty() {
-        SampleClock::new()
-    } else {
-        SampleClock::with_session_id(cli.ipc_session_id.clone())
-    };
     let mut supervisor = Supervisor::new(
-        SupervisorConfig {
-            force_software_only: cli.force_software_only,
-            cadence_ms: cli.step_interval_ms,
-            nvml_timeout: NVML_TIMEOUT,
-            dashboard: true,
-        },
+        supervisor_config(cli),
         SupervisorParts {
             machine: SafetyMachine::with_policy(policy),
-            sample_clock,
+            sample_clock: sample_clock_for(cli),
             publisher: build_publisher(cli),
             actuator,
             acquirer: bridge,
             gate: nvml_gate,
             clock: Arc::new(unix_now_ms),
+            monotonic: monotonic_ms_clock(),
             relay_metrics,
         },
     );
@@ -785,9 +797,11 @@ impl Cli {
         let config = self.safety_policy_config();
         config.resolve(None)?;
         if self.step_interval_ms > config.max_acquisition_interval_ms
-            || self.step_interval_ms.saturating_mul(10) > config.max_sample_age_ms
+            || self.step_interval_ms > config.max_sample_age_ms
         {
-            return Err("step interval exceeds safety acquisition limit or ten-tick evaluation exceeds sample-age limit".into());
+            return Err(
+                "step interval exceeds safety acquisition limit or sample-age limit".into(),
+            );
         }
         Ok(config)
     }
@@ -982,6 +996,7 @@ mod tests {
             SupervisorConfig {
                 force_software_only: true,
                 cadence_ms: 100,
+                eval_interval_ms: SAFETY_EVAL_CADENCE_MS,
                 nvml_timeout: NVML_TIMEOUT,
                 dashboard: false,
             },
@@ -993,6 +1008,7 @@ mod tests {
                 acquirer: Arc::new(HardwareBridge::new(None)),
                 gate: NvmlGate::default(),
                 clock: Arc::new(unix_now_ms),
+                monotonic: monotonic_ms_clock(),
                 relay_metrics: Arc::clone(&relay_metrics),
             },
         );
