@@ -162,14 +162,8 @@ pub fn run_gpu_hardware_smoke_if_requested() -> Result<bool, Box<dyn std::error:
 #[doc(hidden)]
 pub fn prepare() -> Result<SupervisorStart, Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    let config = cli.safety_policy_config();
     // Reject contradictory operator inputs before NVML, locks, ports or workers.
-    config.resolve(None)?;
-    if cli.step_interval_ms > config.max_acquisition_interval_ms
-        || cli.step_interval_ms.saturating_mul(10) > config.max_sample_age_ms
-    {
-        return Err("step interval exceeds safety acquisition limit or ten-tick evaluation exceeds sample-age limit".into());
-    }
+    let config = cli.validated_safety_policy_config()?;
 
     // Block while a pre-rename instance still holds its legacy lock, then
     // acquire the process lock before any potentially blocking driver call.
@@ -478,13 +472,7 @@ fn run_gpu_hardware_actuation_smoke(
     // Same operator-input validation as `prepare`, before any lock or NVML
     // call: a step interval above the acquisition limit would brake the device
     // and then classify every streak sample as stale.
-    let config = cli.safety_policy_config();
-    config.resolve(None)?;
-    if cli.step_interval_ms > config.max_acquisition_interval_ms
-        || cli.step_interval_ms.saturating_mul(10) > config.max_sample_age_ms
-    {
-        return Err("step interval exceeds safety acquisition limit or ten-tick evaluation exceeds sample-age limit".into());
-    }
+    let config = cli.validated_safety_policy_config()?;
     if let Ok(sha) = std::env::var("GITHUB_SHA") {
         println!("Trusted commit: {sha}");
     }
@@ -737,6 +725,22 @@ fn parse_sensory_queue_capacity(s: &str) -> Result<usize, String> {
 }
 
 impl Cli {
+    /// The policy config, after rejecting contradictory operator inputs and a
+    /// step interval the safety policy cannot keep fresh. Shared by the
+    /// supervisor and the actuation smoke so the two cannot drift.
+    fn validated_safety_policy_config(
+        &self,
+    ) -> Result<SafetyPolicyConfig, Box<dyn std::error::Error>> {
+        let config = self.safety_policy_config();
+        config.resolve(None)?;
+        if self.step_interval_ms > config.max_acquisition_interval_ms
+            || self.step_interval_ms.saturating_mul(10) > config.max_sample_age_ms
+        {
+            return Err("step interval exceeds safety acquisition limit or ten-tick evaluation exceeds sample-age limit".into());
+        }
+        Ok(config)
+    }
+
     fn safety_policy_config(&self) -> SafetyPolicyConfig {
         SafetyPolicyConfig {
             temp_warn_c: self.safety_temp_warn_c,
