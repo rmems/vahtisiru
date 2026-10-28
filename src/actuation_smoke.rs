@@ -18,8 +18,9 @@
 //!
 //! 1. The resolved GPU UUID must equal the operator-supplied UUID.
 //! 2. Current and default limits must be readable, positive, and the current
-//!    limit must sit at/above the default — a leftover relay brake or a foreign
-//!    sub-default cap is never adopted.
+//!    limit must equal the default (±tolerance) — a leftover relay brake, a
+//!    foreign sub-default cap, or an operator limit raised above the default
+//!    is never adopted (release restores *default*, which would discard it).
 //! 3. The planned apply command must pin `-i <UUID>` before `-pl <watts>` and
 //!    target exactly the brake wattage; an unscoped `nvidia-smi -pl` plan is a
 //!    refusal.
@@ -422,12 +423,27 @@ impl<B: ActuationSmokeBackend> Smoke<'_, B> {
             PowerLimitObservation::AtOrAboveDefault {
                 current_w,
                 default_w,
-            } if current_w > 0 && default_w > 0 => (current_w, default_w),
-            PowerLimitObservation::AtOrAboveDefault { .. } => {
-                return Err(refuse(
-                    SmokeStage::PreState,
-                    "NVML reported a non-positive power limit",
-                ));
+            } if current_w > 0
+                && default_w > 0
+                && current_w.abs_diff(default_w) <= BRAKE_MATCH_TOLERANCE_W =>
+            {
+                (current_w, default_w)
+            }
+            PowerLimitObservation::AtOrAboveDefault {
+                current_w,
+                default_w,
+            } => {
+                // Release always restores *default*; an operator limit raised
+                // above it would be silently lost, so refuse rather than
+                // "restore" to a value the device did not start at.
+                let reason = if current_w == 0 || default_w == 0 {
+                    "NVML reported a non-positive power limit".to_string()
+                } else {
+                    format!(
+                        "current limit {current_w} W is above the device default {default_w} W; release restores the default, which would discard that setting. Set the limit to the default before re-running"
+                    )
+                };
+                return Err(refuse(SmokeStage::PreState, reason));
             }
             PowerLimitObservation::Unreadable => {
                 return Err(refuse(
@@ -902,6 +918,24 @@ mod tests {
     }
 
     #[test]
+    fn operator_limit_above_default_refuses_rather_than_silently_lowering_it() {
+        // Release restores default (300 W); a 350 W operator setting would be
+        // lost and the run would still print PASSED. Refuse up front.
+        let mut backend = FakeBackend::healthy(350, 300);
+        let (result, _) = run(&mut backend);
+        let failure = result.unwrap_err();
+        assert_refused(&backend, &failure, SmokeStage::PreState);
+        assert!(failure.reason.contains("above the device default"));
+    }
+
+    #[test]
+    fn pre_state_within_tolerance_of_default_is_accepted() {
+        let mut backend = FakeBackend::healthy(402, 400);
+        let (result, _) = run(&mut backend);
+        assert_eq!(result.unwrap().pre_current_w, 402);
+    }
+
+    #[test]
     fn unreadable_or_zero_limits_refuse() {
         for (current, default) in [(None, Some(400)), (Some(400), None), (None, None)] {
             let mut backend = FakeBackend::healthy(400, 400).with_state(|s| {
@@ -983,13 +1017,17 @@ mod tests {
     }
 
     #[test]
-    fn foreign_uuid_probe_targets_a_valid_but_nonexistent_device() {
+    fn foreign_uuid_probe_is_a_list_only_scoped_invocation() {
         let args = sudo_foreign_uuid_probe_args(200);
         assert_eq!(&args[3..7], ["sudo", "-n", "-l", "--"]);
         assert_eq!(
             &args[7..],
             ["nvidia-smi", "-i", FOREIGN_PROBE_UUID, "-pl", "200"]
         );
+    }
+
+    #[test]
+    fn foreign_probe_uuid_is_well_formed_but_not_the_target() {
         assert!(crate::gpu::is_valid_gpu_uuid(FOREIGN_PROBE_UUID));
         assert_ne!(FOREIGN_PROBE_UUID, UUID);
     }
@@ -1011,7 +1049,7 @@ mod tests {
         // own it, so cleanup must report failure and defer to the operator.
         let mut backend =
             FakeBackend::healthy(400, 400).with_state(|s| s.apply_lands_on = Some(Some(150)));
-        let (result, log) = run(&mut backend);
+        let (result, _) = run(&mut backend);
         let failure = result.unwrap_err();
         assert_eq!(failure.stage, SmokeStage::ApplyObservation);
         assert!(matches!(
@@ -1021,6 +1059,13 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn bad_apply_skips_the_streak_and_names_recovery() {
+        let mut backend =
+            FakeBackend::healthy(400, 400).with_state(|s| s.apply_lands_on = Some(Some(150)));
+        let (_, log) = run(&mut backend);
         assert_eq!(backend.health_calls, 0, "no streak after a bad apply");
         assert!(log.contains(&recovery_command(UUID, 400)));
     }
@@ -1029,7 +1074,7 @@ mod tests {
     fn unhealthy_sample_in_streak_holds_the_brake_and_fails() {
         let mut backend = FakeBackend::healthy(400, 400);
         backend.health = VecDeque::from([Ok(()), Err("Critical(temp)".to_string())]);
-        let (result, log) = run(&mut backend);
+        let (result, _) = run(&mut backend);
         let failure = result.unwrap_err();
         assert_eq!(failure.stage, SmokeStage::HealthyStreak);
         assert!(failure.reason.contains("sample 2/3"));
@@ -1040,12 +1085,19 @@ mod tests {
                 current_w: Some(200)
             }
         );
+    }
+
+    #[test]
+    fn held_brake_is_never_released_and_is_reported() {
+        let mut backend = FakeBackend::healthy(400, 400);
+        backend.health = VecDeque::from([Err("Critical(temp)".to_string())]);
+        let (result, log) = run(&mut backend);
         assert_eq!(
             (backend.release_calls(), backend.current_w()),
             (0, Some(200))
         );
         assert!(log.contains("BRAKE HELD"));
-        assert!(failure.to_string().contains("BRAKE HELD"));
+        assert!(result.unwrap_err().to_string().contains("BRAKE HELD"));
     }
 
     #[test]
@@ -1059,7 +1111,7 @@ mod tests {
     #[test]
     fn release_error_reports_cleanup_failure_and_recovery() {
         let mut backend = FakeBackend::healthy(400, 400).with_state(|s| s.fail_release = true);
-        let (result, log) = run(&mut backend);
+        let (result, _) = run(&mut backend);
         let failure = result.unwrap_err();
         assert_eq!(failure.stage, SmokeStage::Release);
         assert!(matches!(
@@ -1069,8 +1121,14 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn release_error_names_recovery_in_log_and_display() {
+        let mut backend = FakeBackend::healthy(400, 400).with_state(|s| s.fail_release = true);
+        let (result, log) = run(&mut backend);
         assert!(log.contains(&recovery_command(UUID, 400)));
-        assert!(failure.to_string().contains("CLEANUP FAILED"));
+        assert!(result.unwrap_err().to_string().contains("CLEANUP FAILED"));
     }
 
     #[test]

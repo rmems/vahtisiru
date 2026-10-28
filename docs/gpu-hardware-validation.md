@@ -109,10 +109,12 @@ mutation.
 1. **Identity.** Resolves NVML index 0 and refuses unless its UUID equals the
    operator-supplied one.
 2. **Pre-state.** Reads current and default limits through that UUID. Refuses
-   unless both are readable, positive, and the current limit is at/above the
-   default. A leftover relay brake (current ≈ 50 % of default) or a foreign
-   sub-default cap is never adopted — the run names the recovery command and
-   stops.
+   unless both are readable, positive, and the current limit equals the
+   default (±2 W). A leftover relay brake (current ≈ 50 % of default) or a
+   foreign sub-default cap is never adopted — the run names the recovery
+   command and stops. An operator limit *above* the default is refused too:
+   release restores the default, so a green run would otherwise silently
+   discard that setting.
 3. **Command plan.** Asks the actuator for the exact `nvidia-smi` argument
    vector it would run for both the brake target and the default, and refuses
    unless each pins `-i <UUID>` before a single `-pl <W>`. An unscoped
