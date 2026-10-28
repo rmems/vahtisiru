@@ -109,16 +109,19 @@ deadline rather than every tick.
 If policy wants the brake (`desired_brake`) while a **Release** is in flight,
 the release is flagged superseded: a worker that has not yet reached the driver
 skips it. A call already inside `nvidia-smi -pl` cannot be interrupted, so it
-completes (bounded by the 5 s + 2 s `timeout -k`), is recorded honestly as
-`Released`, and Apply is dispatched in that same step.
+completes (the actuation command is wrapped in `timeout -k 2 5s`), is recorded
+honestly as `Released`, and the supervisor then re-reads telemetry before it
+attempts Apply. That read can be slow, and a timed-out read keeps the NVML gate
+held, which leaves Apply pending until the gate frees.
 
-Bounds (default 100 ms tick, 1 s deadline): detect-to-brake dispatch is at most
-one eval period (1 s) plus one tick plus acquire time (≤ 2 s `NVML_TIMEOUT`);
-the full-power window when a Release was already in flight is at most the
-remainder of that release's actuation timeout (≤ 7 s) plus one tick, never
-extended by the eval cadence. `SAFETY_STALE_AFTER_MS` (2 s) stays an
-independent fail-closed bound on sample age. `SafetyMachine::evaluate`
-never publishes and never calls `nvidia-smi`. Pre-telemetry snapshots are
+No end-to-end detect-to-brake or full-power-window bound is guaranteed. The
+evaluation deadline (1 s) bounds how often a frame is evaluated, not when the
+brake lands: a timed-out acquisition can hold the NVML gate after fail-closed
+evaluation requests Apply, a post-actuation read can delay Apply, and the
+release timeout does not bound the full-power window. `SAFETY_STALE_AFTER_MS`
+(2 s) stays an independent fail-closed bound on sample age.
+
+`SafetyMachine::evaluate` never publishes and never calls `nvidia-smi`. Pre-telemetry snapshots are
 not dispatched as hardware commands: `--force-software-only` must be
 classified first (hold, do not apply).
 
