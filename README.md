@@ -127,7 +127,11 @@ The optional [trusted hardware validation lane](docs/gpu-hardware-validation.md)
 can be manually dispatched by maintainers from `main` to read real NVML
 identity, telemetry, and power-limit state on a dedicated self-hosted NVIDIA
 runner. It is read-only and supplements the normal software-only CI jobs; it
-does not run for public pull requests or change the GPU power limit.
+does not run for public pull requests or change the GPU power limit. A
+separate maintainer-only actuation smoke (`--gpu-hardware-actuation-smoke`,
+documented in the same page) applies and releases the relay brake on that
+runner to prove the real UUID-scoped actuation path, with an explicit
+operator recovery procedure.
 
 ## Features
 

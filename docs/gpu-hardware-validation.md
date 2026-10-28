@@ -48,9 +48,128 @@ nvidia-smi -L
 cargo run --locked --bin vahtisiru -- --gpu-hardware-smoke
 ```
 
-## Actuation validation
+## Actuation smoke (maintainer only)
 
-This issue adds no actuation lane. Any future power-limit test must remain a
-separate deliberate maintainer action, require explicit UUID confirmation, and
-restore and verify the original state even after a failed assertion. It must
-never use an unscoped `nvidia-smi -pl` command.
+The `Trusted GPU Hardware Actuation Smoke` workflow
+(`.github/workflows/gpu-hardware-actuation-smoke.yml`) is the Phase 2 lane:
+it **mutates the GPU power limit** on the trusted runner to prove the real
+brake path applies and releases correctly. It is a separate, deliberate
+maintainer action — never a PR check, never scheduled, and never a release
+gate. Software-only CI remains authoritative for portable behaviour; this
+lane only adds evidence that the production actuator works on one physical
+device.
+
+### Trust boundary
+
+Same runner labels and ref guard as the read-only smoke, plus:
+
+- Dispatch requires two explicit inputs: the physical GPU UUID that may be
+  mutated and a ticked `confirm_mutation` acknowledgement. The job does not
+  start without both and without `github.ref == refs/heads/main`.
+- A `concurrency` group serialises actuation runs and never cancels one in
+  progress, so cleanup is not interrupted by a second dispatch.
+- The job has `contents: read` only and checks out without credentials. No
+  secret is required or exposed; the sudoers rule is host configuration.
+
+### Required host configuration
+
+In addition to the read-only requirements, the runner user needs a
+non-interactive sudoers rule that permits **only** the UUID-scoped
+power-limit form the relay uses, for example:
+
+```text
+runner ALL=(root) NOPASSWD: /usr/bin/nvidia-smi -i GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx -pl [0-9]*
+```
+
+The smoke checks this rule with `sudo -n -l -- nvidia-smi -i <UUID> -pl <W>`
+for both the apply and the release wattage **before** running anything.
+`sudo -l <command>` exits non-zero when the rule does not match, and runs
+nothing either way. A password prompt, a missing rule, or a rule that only
+matches the older unscoped `nvidia-smi -pl` form is a refusal with no
+mutation.
+
+### What the run does
+
+`vahtisiru --gpu-hardware-actuation-smoke --gpu-hardware-actuation-uuid <UUID>`
+(the `actuation_smoke` module, driven through the same `GpuTarget`,
+`NvmlActuator`, and `HardwareBridge` the supervisor uses):
+
+1. **Identity.** Resolves NVML index 0 and refuses unless its UUID equals the
+   operator-supplied one.
+2. **Pre-state.** Reads current and default limits through that UUID. Refuses
+   unless both are readable, positive, and the current limit is at/above the
+   default. A leftover relay brake (current ≈ 50 % of default) or a foreign
+   sub-default cap is never adopted — the run names the recovery command and
+   stops.
+3. **Command plan.** Asks the actuator for the exact `nvidia-smi` argument
+   vector it would run for both the brake target and the default, and refuses
+   unless each pins `-i <UUID>` before a single `-pl <W>`. An unscoped
+   `nvidia-smi -pl` plan cannot reach the hardware.
+4. **Sudo.** The `sudo -l` check above, for both wattages.
+5. **Apply.** Prints the operator recovery command, then calls the production
+   `apply_emergency_brake`. Reads the limit back and requires it to be within
+   ±2 W of the target.
+6. **Healthy streak.** Acquires real NVML samples at the step interval and
+   classifies each under the policy resolved against the device default
+   (exactly as the supervisor does). Requires `--safety-release-ok-streak`
+   consecutive real `Ok` samples (default 3) before releasing.
+7. **Release.** Calls the production `release_emergency_brake`, reads the
+   limit back, and requires it to be within ±2 W of the default.
+
+The log records the trusted commit (`GITHUB_SHA`), UUID, pre-test
+current/default limits, apply target, post-apply observation, each streak
+sample, post-release observation, and the cleanup result. The final
+`GPU actuation smoke PASSED` line is printed only after the post-release limit
+has been **observed** at the default; a run that cannot observe that never
+claims success. The workflow also prints the limits through `nvidia-smi`
+before and (with `if: always()`) after the step, so a timed-out or cancelled
+job still leaves evidence of the device state.
+
+### Failure, cleanup, and operator recovery
+
+Any failure after the brake is applied — unexpected post-apply limit, an
+unhealthy sample during the streak, a release error, or a post-release limit
+that is not the default — triggers one cleanup release through the same
+scoped command, followed by a read-back. The result reports one of:
+
+- `cleanup restored default` — the device was observed back at default.
+- `CLEANUP FAILED` — the device could not be confirmed at default. The job
+  fails and prints the recovery command.
+
+If a run fails with `CLEANUP FAILED`, is cancelled, or times out, check the
+`Record post-test power limits` step (or run `nvidia-smi -i <UUID>
+--query-gpu=power.limit,power.default_limit --format=csv` on the host). If
+`power.limit` is below `power.default_limit`, restore it with the same
+UUID-scoped form the relay uses (the sudoers rule above already permits it):
+
+```sh
+sudo -n nvidia-smi -i <UUID> -pl <power.default_limit>
+nvidia-smi -i <UUID> --query-gpu=power.limit,power.default_limit --format=csv
+```
+
+Do not re-run the actuation smoke until the read-back shows the default; the
+pre-state check will refuse a leftover brake anyway. A reboot also restores
+the driver default.
+
+### Local invocation
+
+Only on a trusted Linux host you own, with the sudoers rule above:
+
+```sh
+nvidia-smi -L
+cargo run --locked --bin vahtisiru -- \
+  --gpu-hardware-actuation-smoke \
+  --gpu-hardware-actuation-uuid GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+```
+
+`--force-software-only` is refused in this mode, and the two flags cannot be
+combined with `--gpu-hardware-smoke`.
+
+### Why software-only CI stays authoritative
+
+Every refusal, observation, and cleanup branch of the actuation sequence is a
+pure function of a backend trait and is exercised in `cargo test` with a
+scripted fake (`src/actuation_smoke.rs`), with no GPU, `sudo`, or subprocess.
+The hardware lane proves that one specific device, driver, and sudoers rule
+behave as that logic assumes; it cannot prove portability, and a green
+hardware run is not a substitute for the hosted jobs.

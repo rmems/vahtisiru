@@ -1,0 +1,89 @@
+name: Trusted GPU Hardware Actuation Smoke
+
+# MAINTAINER ONLY. This lane mutates the GPU power limit on the trusted
+# self-hosted workstation: it applies the relay brake, waits for the healthy
+# streak, releases, and verifies the device is back at its default. It never
+# runs for pull requests and is routed only to the dedicated NVIDIA runner.
+# See docs/gpu-hardware-validation.md for the trust boundary, sudo rule, and
+# operator recovery procedure.
+
+on:
+  workflow_dispatch:
+    inputs:
+      gpu_uuid:
+        description: >-
+          Explicit confirmation of the physical GPU UUID that may be mutated
+          (GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx, as printed by nvidia-smi -L).
+          The smoke refuses if NVML index 0 resolves to anything else.
+        required: true
+        type: string
+      confirm_mutation:
+        description: >-
+          I understand this run changes the GPU power limit on the trusted
+          runner and I have read the recovery procedure.
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  actuation-smoke:
+    name: Apply/release relay brake on real hardware
+    # Manual dispatch can select a branch. Only route the job to the privileged
+    # workstation when the selected ref is the protected main branch and the
+    # operator ticked the explicit mutation acknowledgement.
+    if: github.ref == 'refs/heads/main' && inputs.confirm_mutation == true
+    runs-on: [self-hosted, linux, x64, gpu, nvidia]
+    # One actuation run at a time on the shared device; never cancel a run
+    # mid-brake (cleanup must finish).
+    concurrency:
+      group: gpu-hardware-actuation
+      cancel-in-progress: false
+    timeout-minutes: 15
+    steps:
+      - name: Checkout trusted main commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Show trusted commit and dispatch inputs
+        env:
+          GPU_UUID: ${{ inputs.gpu_uuid }}
+        run: |
+          set -euo pipefail
+          echo "Trusted commit: $(git rev-parse HEAD)"
+          echo "Operator-confirmed GPU UUID: ${GPU_UUID}"
+          echo "Dispatched by: ${GITHUB_ACTOR}"
+
+      - name: Record pre-test power limits (read-only)
+        env:
+          GPU_UUID: ${{ inputs.gpu_uuid }}
+        run: |
+          set -euo pipefail
+          timeout -k 2s 5s nvidia-smi -i "${GPU_UUID}" \
+            --query-gpu=uuid,power.limit,power.default_limit --format=csv
+
+      - name: Apply, observe, release, and verify the relay brake
+        env:
+          GPU_UUID: ${{ inputs.gpu_uuid }}
+        run: |
+          set -euo pipefail
+          cargo run --locked --bin vahtisiru -- \
+            --gpu-hardware-actuation-smoke \
+            --gpu-hardware-actuation-uuid "${GPU_UUID}"
+
+      # Always record the device state after the run, including on failure,
+      # timeout, or cancellation, so an operator can see whether recovery is
+      # needed without trusting the previous step's own claim.
+      - name: Record post-test power limits (read-only, always)
+        if: always()
+        env:
+          GPU_UUID: ${{ inputs.gpu_uuid }}
+        run: |
+          set -euo pipefail
+          timeout -k 2s 5s nvidia-smi -i "${GPU_UUID}" \
+            --query-gpu=uuid,power.limit,power.default_limit --format=csv
+          echo "If power.limit is below power.default_limit, run the operator recovery procedure in docs/gpu-hardware-validation.md"
