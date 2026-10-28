@@ -56,6 +56,12 @@ pub(crate) trait ActuationSmokeBackend {
     /// setting `limit_w` on the resolved device.
     fn check_sudo_permission(&self, limit_w: u32) -> Result<(), String>;
 
+    /// Verify, without running `nvidia-smi`, that non-interactive sudo does
+    /// **not** permit the unscoped `nvidia-smi -pl <limit_w>` form. A bare or
+    /// wildcard grant would pass the scoped probe while violating the
+    /// UUID-only privilege boundary. `Ok(())` only when sudo denies it.
+    fn check_sudo_denies_unscoped(&self, limit_w: u32) -> Result<(), String>;
+
     /// The relay's actuator for the resolved device.
     fn actuator(&self) -> &dyn SafetyActuator;
 
@@ -236,6 +242,24 @@ pub(crate) fn sudo_permission_check_args(uuid: &str, limit_w: u32) -> Vec<String
     ]
 }
 
+/// Argument vector for the negative `sudo -l` probe: the *unscoped*
+/// `nvidia-smi -pl <limit_w>` form, which a correctly scoped sudoers rule must
+/// deny. Runs nothing either way.
+pub(crate) fn sudo_unscoped_probe_args(limit_w: u32) -> Vec<String> {
+    vec![
+        "-k".to_string(),
+        "2".to_string(),
+        "5s".to_string(),
+        "sudo".to_string(),
+        "-n".to_string(),
+        "-l".to_string(),
+        "--".to_string(),
+        "nvidia-smi".to_string(),
+        "-pl".to_string(),
+        limit_w.to_string(),
+    ]
+}
+
 /// Pure check that a planned argument vector is the scoped
 /// `nvidia-smi -i <uuid> -pl <limit_w>` form and nothing else sets a limit.
 pub(crate) fn validate_scoped_plan(
@@ -330,6 +354,7 @@ pub(crate) fn run_actuation_smoke<B: ActuationSmokeBackend>(
         backend,
         uuid,
         default_w: 0,
+        applied_w: None,
         out,
     };
     let (pre_current_w, target_w) = smoke.check_pre_state()?;
@@ -357,6 +382,10 @@ struct Smoke<'a, B: ActuationSmokeBackend> {
     uuid: String,
     /// Device default in watts; set by [`Self::check_pre_state`].
     default_w: u32,
+    /// Limit observed right after apply; set by [`Self::apply_and_observe`].
+    /// Reused by the hold-the-brake report so that path makes no further
+    /// (unbounded) NVML query.
+    applied_w: Option<u32>,
     out: &'a mut dyn Write,
 }
 
@@ -456,7 +485,15 @@ impl<B: ActuationSmokeBackend> Smoke<'_, B> {
                 .check_sudo_permission(limit_w)
                 .map_err(|reason| refuse(SmokeStage::SudoPermission, reason))?;
         }
-        let _ = writeln!(self.out, "sudo -n permits apply and release commands");
+        // A grant that also permits the unscoped form is wider than the
+        // documented boundary; refuse to mutate on such a host.
+        self.backend
+            .check_sudo_denies_unscoped(target_w)
+            .map_err(|reason| refuse(SmokeStage::SudoPermission, reason))?;
+        let _ = writeln!(
+            self.out,
+            "sudo -n permits the UUID-scoped apply and release commands and denies the unscoped form"
+        );
         Ok(())
     }
 
@@ -472,6 +509,7 @@ impl<B: ActuationSmokeBackend> Smoke<'_, B> {
             return Err(self.fail_after_mutation(SmokeStage::Apply, actuator_reason(&err)));
         }
         let (observed, _) = self.limits();
+        self.applied_w = observed;
         let _ = writeln!(self.out, "Post-apply current limit: {}", fmt_w(observed));
         within_tolerance(observed, target_w).ok_or_else(|| {
             self.fail_after_mutation(
@@ -548,10 +586,13 @@ impl<B: ActuationSmokeBackend> Smoke<'_, B> {
             "FAILURE at {}: {reason}",
             SmokeStage::HealthyStreak.as_str()
         );
-        let (current_w, _) = self.limits();
+        // Report the limit observed after apply rather than querying NVML
+        // again: this path is reached when a driver read may already be
+        // wedged, and it must not block on another unbounded call.
+        let current_w = self.applied_w;
         let _ = writeln!(
             self.out,
-            "BRAKE HELD: telemetry not healthy; leaving limit at {}. Release only once healthy: {}",
+            "BRAKE HELD: telemetry not healthy; leaving limit at {} (as observed after apply). Release only once healthy: {}",
             fmt_w(current_w),
             recovery_command(&self.uuid, self.default_w)
         );
@@ -671,6 +712,7 @@ mod tests {
         actuator: ScriptedActuator,
         plan_override: Option<Option<Vec<String>>>,
         sudo_ok: bool,
+        sudo_denies_unscoped: bool,
         health: VecDeque<Result<(), String>>,
         health_calls: u32,
     }
@@ -693,6 +735,7 @@ mod tests {
                 },
                 plan_override: None,
                 sudo_ok: true,
+                sudo_denies_unscoped: true,
                 health: VecDeque::new(),
                 health_calls: 0,
             }
@@ -743,6 +786,13 @@ mod tests {
                 Ok(())
             } else {
                 Err("sudo -n -l refused".into())
+            }
+        }
+        fn check_sudo_denies_unscoped(&self, _limit_w: u32) -> Result<(), String> {
+            if self.sudo_denies_unscoped {
+                Ok(())
+            } else {
+                Err("sudo -n -l permits unscoped nvidia-smi -pl".into())
             }
         }
         fn actuator(&self) -> &dyn SafetyActuator {
@@ -897,6 +947,25 @@ mod tests {
         backend.sudo_ok = false;
         let (result, _) = run(&mut backend);
         assert_refused(&backend, &result.unwrap_err(), SmokeStage::SudoPermission);
+    }
+
+    #[test]
+    fn unscoped_sudo_grant_prevents_mutation() {
+        // Scoped form permitted, but so is the unscoped one: too wide, refuse.
+        let mut backend = FakeBackend::healthy(400, 400);
+        backend.sudo_denies_unscoped = false;
+        let (result, _) = run(&mut backend);
+        let failure = result.unwrap_err();
+        assert_refused(&backend, &failure, SmokeStage::SudoPermission);
+        assert!(failure.reason.contains("unscoped"));
+    }
+
+    #[test]
+    fn unscoped_probe_is_a_list_only_invocation_without_a_device_selector() {
+        let args = sudo_unscoped_probe_args(200);
+        assert_eq!(&args[3..7], ["sudo", "-n", "-l", "--"]);
+        assert!(!args.iter().any(|a| a == "-i"));
+        assert_eq!(&args[7..], ["nvidia-smi", "-pl", "200"]);
     }
 
     #[test]

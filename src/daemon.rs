@@ -13,6 +13,7 @@ use tokio::time::sleep;
 
 use crate::actuation_smoke::{
     ActuationSmokeBackend, run_actuation_smoke, sudo_permission_check_args,
+    sudo_unscoped_probe_args,
 };
 use crate::cpu::{self, RelayMetrics};
 use crate::gpu::{GpuTarget, HardwareBridge, NvmlActuator, is_valid_gpu_uuid};
@@ -428,6 +429,28 @@ impl ActuationSmokeBackend for NvmlActuationSmokeBackend {
                 "`sudo -n -l -- nvidia-smi -i {} -pl {limit_w}` exited with {status}; the sudoers rule must permit this exact command non-interactively",
                 self.target.uuid()
             ))
+        }
+    }
+
+    fn check_sudo_denies_unscoped(&self, limit_w: u32) -> Result<(), String> {
+        let args = sudo_unscoped_probe_args(limit_w);
+        let status = std::process::Command::new("timeout")
+            .args(&args)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .map_err(|e| format!("could not execute `timeout {}`: {e}", args.join(" ")))?;
+        // `sudo -l <command>` exits 0 when permitted and 1 when the rule does
+        // not match. Only an explicit denial is acceptable; a timeout or any
+        // other status is ambiguous and fails closed.
+        match status.code() {
+            Some(1) => Ok(()),
+            Some(0) => Err(format!(
+                "sudo permits the unscoped `nvidia-smi -pl {limit_w}`; the sudoers rule must be restricted to `-i {} -pl <W>`",
+                self.target.uuid()
+            )),
+            other => Err(format!(
+                "unscoped sudo probe `sudo -n -l -- nvidia-smi -pl {limit_w}` exited with {other:?}; cannot confirm the rule is scoped"
+            )),
         }
     }
 
