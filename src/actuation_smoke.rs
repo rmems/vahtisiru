@@ -242,22 +242,36 @@ pub(crate) fn sudo_permission_check_args(uuid: &str, limit_w: u32) -> Vec<String
     ]
 }
 
+/// A syntactically valid physical-GPU UUID that no real device carries. Used
+/// to probe whether the sudoers rule is wider than the one validated UUID.
+pub(crate) const FOREIGN_PROBE_UUID: &str = "GPU-00000000-0000-0000-0000-000000000000";
+
 /// Argument vector for the negative `sudo -l` probe: the *unscoped*
 /// `nvidia-smi -pl <limit_w>` form, which a correctly scoped sudoers rule must
 /// deny. Runs nothing either way.
 pub(crate) fn sudo_unscoped_probe_args(limit_w: u32) -> Vec<String> {
-    vec![
-        "-k".to_string(),
-        "2".to_string(),
-        "5s".to_string(),
-        "sudo".to_string(),
-        "-n".to_string(),
-        "-l".to_string(),
-        "--".to_string(),
-        "nvidia-smi".to_string(),
-        "-pl".to_string(),
-        limit_w.to_string(),
-    ]
+    sudo_list_args(&["nvidia-smi", "-pl", &limit_w.to_string()])
+}
+
+/// Argument vector for the second negative probe: the scoped form aimed at a
+/// UUID that is not the validated target. A `-i GPU-*`-style wildcard rule
+/// permits it; a rule pinned to one UUID denies it.
+pub(crate) fn sudo_foreign_uuid_probe_args(limit_w: u32) -> Vec<String> {
+    sudo_list_args(&[
+        "nvidia-smi",
+        "-i",
+        FOREIGN_PROBE_UUID,
+        "-pl",
+        &limit_w.to_string(),
+    ])
+}
+
+fn sudo_list_args(command: &[&str]) -> Vec<String> {
+    ["-k", "2", "5s", "sudo", "-n", "-l", "--"]
+        .iter()
+        .chain(command)
+        .map(|s| s.to_string())
+        .collect()
 }
 
 /// Pure check that a planned argument vector is the scoped
@@ -966,6 +980,18 @@ mod tests {
         assert_eq!(&args[3..7], ["sudo", "-n", "-l", "--"]);
         assert!(!args.iter().any(|a| a == "-i"));
         assert_eq!(&args[7..], ["nvidia-smi", "-pl", "200"]);
+    }
+
+    #[test]
+    fn foreign_uuid_probe_targets_a_valid_but_nonexistent_device() {
+        let args = sudo_foreign_uuid_probe_args(200);
+        assert_eq!(&args[3..7], ["sudo", "-n", "-l", "--"]);
+        assert_eq!(
+            &args[7..],
+            ["nvidia-smi", "-i", FOREIGN_PROBE_UUID, "-pl", "200"]
+        );
+        assert!(crate::gpu::is_valid_gpu_uuid(FOREIGN_PROBE_UUID));
+        assert_ne!(FOREIGN_PROBE_UUID, UUID);
     }
 
     #[test]

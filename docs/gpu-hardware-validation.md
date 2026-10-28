@@ -117,11 +117,13 @@ mutation.
    vector it would run for both the brake target and the default, and refuses
    unless each pins `-i <UUID>` before a single `-pl <W>`. An unscoped
    `nvidia-smi -pl` plan cannot reach the hardware.
-4. **Sudo.** The `sudo -l` check above, for both wattages, plus a negative
-   probe: `sudo -n -l -- nvidia-smi -pl <W>` (no `-i`) must be *denied*. A
-   bare or wildcard `nvidia-smi` grant passes the scoped check but is wider
-   than the documented boundary, so the smoke refuses to mutate on such a
-   host.
+4. **Sudo.** The `sudo -l` check above, for both wattages, plus two negative
+   probes that must be *denied*: `nvidia-smi -pl <W>` with no `-i` (catches a
+   bare or `-pl *` grant) and `nvidia-smi -i GPU-00000000-… -pl <W>` with a
+   valid-but-nonexistent UUID (catches a `-i GPU-*` wildcard). Either being
+   permitted means the rule is wider than the one validated device, and the
+   smoke refuses to mutate. These probes check the rule's effect, not its
+   text; sudoers is not parsed.
 5. **Apply.** Prints the operator recovery command, then calls the production
    `apply_emergency_brake`. Reads the limit back and requires it to be within
    ±2 W of the target.
