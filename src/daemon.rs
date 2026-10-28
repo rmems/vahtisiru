@@ -179,6 +179,24 @@ pub fn prepare() -> Result<SupervisorStart, Box<dyn std::error::Error>> {
     })
 }
 
+fn sample_clock_for(cli: &Cli) -> SampleClock {
+    if cli.ipc_session_id.is_empty() {
+        SampleClock::new()
+    } else {
+        SampleClock::with_session_id(cli.ipc_session_id.clone())
+    }
+}
+
+fn supervisor_config(cli: &Cli) -> SupervisorConfig {
+    SupervisorConfig {
+        force_software_only: cli.force_software_only,
+        cadence_ms: cli.step_interval_ms,
+        eval_interval_ms: SAFETY_EVAL_CADENCE_MS,
+        nvml_timeout: NVML_TIMEOUT,
+        dashboard: true,
+    }
+}
+
 /// Run the supervisor using a lock retained by the caller through runtime shutdown.
 /// This is executable plumbing, not a reusable library API.
 #[doc(hidden)]
@@ -246,22 +264,11 @@ pub async fn run(prepared: &mut SupervisorStart) -> Result<(), Box<dyn std::erro
         );
     }
 
-    let sample_clock = if cli.ipc_session_id.is_empty() {
-        SampleClock::new()
-    } else {
-        SampleClock::with_session_id(cli.ipc_session_id.clone())
-    };
     let mut supervisor = Supervisor::new(
-        SupervisorConfig {
-            force_software_only: cli.force_software_only,
-            cadence_ms: cli.step_interval_ms,
-            eval_interval_ms: SAFETY_EVAL_CADENCE_MS,
-            nvml_timeout: NVML_TIMEOUT,
-            dashboard: true,
-        },
+        supervisor_config(cli),
         SupervisorParts {
             machine: SafetyMachine::with_policy(policy),
-            sample_clock,
+            sample_clock: sample_clock_for(cli),
             publisher: build_publisher(cli),
             actuator,
             acquirer: bridge,
