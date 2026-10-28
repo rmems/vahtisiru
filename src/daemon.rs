@@ -478,6 +478,16 @@ fn run_gpu_hardware_actuation_smoke(
     if let Ok(sha) = std::env::var("GITHUB_SHA") {
         println!("Trusted commit: {sha}");
     }
+    // Take the supervisor's single-instance lock before touching the device.
+    // A running relay drives the same brake target; letting the smoke apply
+    // and release beneath it could lift a real brake mid-fault. Held until
+    // the smoke returns, including through cleanup.
+    check_legacy_lock(LEGACY_PROCESS_LOCK_PATH)
+        .map_err(|msg| format!("{msg} Stop the supervisor before the actuation smoke."))?;
+    let _lock_guard = try_acquire_lock(PROCESS_LOCK_PATH).map_err(|msg| {
+        format!("{msg} Stop the running vahtisiru supervisor before the actuation smoke.")
+    })?;
+    println!("Process lock held: {PROCESS_LOCK_PATH} (no supervisor is running)");
     list_nvidia_devices()?;
 
     let target = GpuTarget::resolve()?;

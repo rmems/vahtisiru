@@ -94,6 +94,12 @@ mutation.
 (the `actuation_smoke` module, driven through the same `GpuTarget`,
 `NvmlActuator`, and `HardwareBridge` the supervisor uses):
 
+0. **Process lock.** Takes the supervisor's single-instance lock
+   (`/tmp/vahtisiru.lock`, plus the legacy-lock check) before any NVML call and
+   holds it through cleanup. A running `vahtisiru` supervisor on the host makes
+   the smoke refuse with no mutation: the two would share one brake target, and
+   the smoke's release could lift a real brake mid-fault. **Stop the
+   supervisor before dispatching.**
 1. **Identity.** Resolves NVML index 0 and refuses unless its UUID equals the
    operator-supplied one.
 2. **Pre-state.** Reads current and default limits through that UUID. Refuses
@@ -130,7 +136,11 @@ job still leaves evidence of the device state.
 Any failure after the brake is applied — unexpected post-apply limit, an
 unhealthy sample during the streak, a release error, or a post-release limit
 that is not the default — triggers one cleanup release through the same
-scoped command, followed by a read-back. The result reports one of:
+production actuator, followed by a read-back. That actuator deliberately
+refuses to restore a limit it does not recognise as the relay's own brake
+(a foreign or unexpected wattage means something else set it), so in those
+cases cleanup reports failure and hands the decision to the operator rather
+than forcing the default. The result reports one of:
 
 - `cleanup restored default` — the device was observed back at default.
 - `CLEANUP FAILED` — the device could not be confirmed at default. The job
@@ -153,11 +163,12 @@ the driver default.
 
 ### Local invocation
 
-Only on a trusted Linux host you own, with the sudoers rule above:
+Only on a trusted Linux host you own, with the sudoers rule above and no
+`vahtisiru` supervisor running:
 
 ```sh
 nvidia-smi -L
-cargo run --locked --bin vahtisiru -- \
+cargo run --release --locked --bin vahtisiru -- \
   --gpu-hardware-actuation-smoke \
   --gpu-hardware-actuation-uuid GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 ```

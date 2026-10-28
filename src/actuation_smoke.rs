@@ -10,8 +10,9 @@
 //! The sequence is a pure function of an [`ActuationSmokeBackend`] so every
 //! refusal, verification, and cleanup path is exercised in software-only CI
 //! with a fake backend. Only the `vahtisiru` executable wires the NVML /
-//! `sudo -n nvidia-smi` backend (see `crate::daemon`). Normal CI never runs
-//! the hardware path.
+//! `sudo -n nvidia-smi` backend (see `crate::daemon`), and it takes the
+//! supervisor's single-instance lock first. Normal CI never runs the hardware
+//! path.
 //!
 //! Fail-closed rules (no mutation unless every pre-check passes):
 //!
@@ -26,9 +27,11 @@
 //!    release command (checked with `sudo -l`, which runs nothing).
 //!
 //! After the brake is applied, any failure (unexpected limit, unhealthy
-//! sample, release error) triggers one cleanup release attempt. Success is
-//! claimed only after the post-release limit has been observed at the device
-//! default; otherwise the result names the explicit operator recovery command.
+//! sample, release error) triggers one cleanup release through the production
+//! actuator — which itself refuses to restore a limit it does not recognise
+//! as the relay's brake. Success is claimed only after the post-release limit
+//! has been observed at the device default; otherwise the result names the
+//! explicit operator recovery command.
 
 use crate::safety::{
     ActuatorError, BRAKE_FRACTION, BRAKE_MATCH_TOLERANCE_W, PowerLimitObservation, SafetyActuator,
@@ -65,6 +68,8 @@ pub(crate) trait ActuationSmokeBackend {
 /// that never mutated hardware.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SmokeStage {
+    /// Caller configuration was invalid (e.g. zero release streak).
+    Config,
     /// Operator UUID did not match the resolved target.
     Identity,
     /// Pre-test power limits were unreadable or not at the device default.
@@ -89,6 +94,7 @@ impl SmokeStage {
     /// Stable log label.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
+            Self::Config => "config",
             Self::Identity => "identity",
             Self::PreState => "pre_state",
             Self::CommandPlan => "command_plan",
@@ -103,9 +109,13 @@ impl SmokeStage {
 
     /// Whether the hardware may have been mutated before this stage failed.
     const fn after_mutation(self) -> bool {
-        !matches!(
+        matches!(
             self,
-            Self::Identity | Self::PreState | Self::CommandPlan | Self::SudoPermission
+            Self::Apply
+                | Self::ApplyObservation
+                | Self::HealthyStreak
+                | Self::Release
+                | Self::ReleaseObservation
         )
     }
 }
@@ -157,7 +167,7 @@ impl fmt::Display for SmokeFailure {
             CleanupOutcome::Failed { reason, current_w } => write!(
                 f,
                 " (CLEANUP FAILED: {reason}; last observed current={}; run the operator recovery procedure)",
-                current_w.map_or("unreadable".to_string(), |w| format!("{w} W"))
+                fmt_w(*current_w)
             ),
         }
     }
@@ -232,40 +242,46 @@ pub(crate) fn validate_scoped_plan(
             pl_positions.len()
         ));
     };
-    let Some(i_pos) = plan.iter().position(|a| a == "-i") else {
-        return Err("planned command has no `-i <UUID>` device selector (unscoped `-pl`)".into());
+    let i_pos = plan
+        .iter()
+        .position(|a| a == "-i")
+        .ok_or("planned command has no `-i <UUID>` device selector (unscoped `-pl`)")?;
+    let selected = plan.get(i_pos + 1).map(String::as_str);
+    let carried = plan.get(pl_pos + 1).map(String::as_str);
+    let limit = limit_w.to_string();
+    let problem = if i_pos >= pl_pos {
+        "sets `-pl` before the `-i <UUID>` selector".to_string()
+    } else if selected != Some(uuid) {
+        format!("selects {selected:?}, not the validated UUID {uuid}")
+    } else if carried != Some(limit.as_str()) {
+        format!("carries limit {carried:?}, expected {limit_w} W")
+    } else if !plan.iter().any(|a| a == "nvidia-smi") {
+        "does not invoke nvidia-smi".to_string()
+    } else {
+        return Ok(());
     };
-    if i_pos >= pl_pos {
-        return Err("planned command sets `-pl` before the `-i <UUID>` selector".into());
-    }
-    if plan.get(i_pos + 1).map(String::as_str) != Some(uuid) {
-        return Err(format!(
-            "planned command selects {:?}, not the validated UUID {uuid}",
-            plan.get(i_pos + 1)
-        ));
-    }
-    if plan.get(pl_pos + 1).map(String::as_str) != Some(limit_w.to_string().as_str()) {
-        return Err(format!(
-            "planned command carries limit {:?}, expected {limit_w} W",
-            plan.get(pl_pos + 1)
-        ));
-    }
-    if !plan.iter().any(|a| a == "nvidia-smi") {
-        return Err("planned command does not invoke nvidia-smi".into());
-    }
-    Ok(())
+    Err(format!("planned command {problem}"))
 }
 
-fn within_tolerance(observed: u32, expected: u32) -> bool {
-    observed.abs_diff(expected) <= BRAKE_MATCH_TOLERANCE_W
+fn within_tolerance(observed: Option<u32>, expected: u32) -> Option<u32> {
+    observed.filter(|w| w.abs_diff(expected) <= BRAKE_MATCH_TOLERANCE_W)
 }
 
 fn refuse(stage: SmokeStage, reason: impl Into<String>) -> SmokeFailure {
+    debug_assert!(!stage.after_mutation());
     SmokeFailure {
         stage,
         reason: reason.into(),
         cleanup: CleanupOutcome::NotNeeded,
     }
+}
+
+fn actuator_reason(err: &ActuatorError) -> String {
+    format!("actuator error: {err:?}")
+}
+
+fn fmt_w(w: Option<u32>) -> String {
+    w.map_or("unreadable".to_string(), |w| format!("{w} W"))
 }
 
 /// Run the apply → observe → healthy streak → release → observe sequence.
@@ -280,6 +296,12 @@ pub(crate) fn run_actuation_smoke<B: ActuationSmokeBackend>(
     release_ok_streak: u32,
     out: &mut dyn Write,
 ) -> Result<SmokeReport, SmokeFailure> {
+    if release_ok_streak == 0 {
+        return Err(refuse(
+            SmokeStage::Config,
+            "release Ok streak must be positive",
+        ));
+    }
     let uuid = backend.resolved_uuid().to_string();
     let _ = writeln!(out, "Resolved GPU UUID: {uuid}");
     if uuid != expected_uuid {
@@ -288,255 +310,251 @@ pub(crate) fn run_actuation_smoke<B: ActuationSmokeBackend>(
             format!("operator confirmed {expected_uuid} but NVML index 0 resolved to {uuid}"),
         ));
     }
-    if release_ok_streak == 0 {
-        return Err(refuse(
-            SmokeStage::PreState,
-            "release Ok streak must be positive",
-        ));
-    }
 
-    // Pre-state: must be at the device default and owned by nobody.
-    let (current, default) = backend.actuator().query_power_limits_w();
-    let _ = writeln!(
+    let mut smoke = Smoke {
+        backend,
+        uuid,
+        default_w: 0,
         out,
-        "Pre-test power limits: current={} default={}",
-        fmt_w(current),
-        fmt_w(default)
-    );
-    let (pre_current_w, pre_default_w) = match classify_power_limit(
-        current,
-        default,
-        BRAKE_FRACTION,
-    ) {
-        PowerLimitObservation::AtOrAboveDefault {
-            current_w,
-            default_w,
-        } if current_w > 0 && default_w > 0 => (current_w, default_w),
-        PowerLimitObservation::AtOrAboveDefault { .. } => {
-            return Err(refuse(
-                SmokeStage::PreState,
-                "NVML reported a non-positive power limit",
-            ));
-        }
-        PowerLimitObservation::Unreadable => {
-            return Err(refuse(
-                SmokeStage::PreState,
-                "current/default power limit unreadable or brake target ambiguous",
-            ));
-        }
-        PowerLimitObservation::RelayOwnedBrake(m) => {
-            return Err(refuse(
-                SmokeStage::PreState,
-                format!(
-                    "a relay-owned brake is already engaged (current={} W, default={} W); recover with `{}` before re-running",
-                    m.current_w,
-                    m.default_w,
-                    recovery_command(&uuid, m.default_w)
-                ),
-            ));
-        }
-        PowerLimitObservation::ForeignSubDefaultCap {
-            current_w,
-            default_w,
-            ..
-        } => {
-            return Err(refuse(
-                SmokeStage::PreState,
-                format!(
-                    "foreign sub-default power cap (current={current_w} W, default={default_w} W); refusing to take ownership"
-                ),
-            ));
-        }
     };
-    let apply_target_w = unambiguous_brake_target(pre_default_w, BRAKE_FRACTION)
-        .ok_or_else(|| refuse(SmokeStage::PreState, "brake target is ambiguous"))?;
-    let _ = writeln!(
-        out,
-        "Apply target: {apply_target_w} W (default x {BRAKE_FRACTION})"
-    );
-    let _ = writeln!(
-        out,
-        "Operator recovery if this run is interrupted: {}",
-        recovery_command(&uuid, pre_default_w)
-    );
+    let (pre_current_w, target_w) = smoke.check_pre_state()?;
+    smoke.check_command_plans(target_w)?;
+    smoke.check_sudo(target_w)?;
 
-    // Command plan: must be the validated UUID-scoped path.
-    for limit_w in [apply_target_w, pre_default_w] {
-        let plan = backend
-            .planned_power_limit_command(limit_w)
-            .ok_or_else(|| refuse(SmokeStage::CommandPlan, "actuator plans no command"))?;
-        validate_scoped_plan(&plan, &uuid, limit_w)
-            .map_err(|reason| refuse(SmokeStage::CommandPlan, reason))?;
-        let _ = writeln!(
-            out,
-            "Planned command ({limit_w} W): timeout {}",
-            plan.join(" ")
-        );
-    }
-
-    // Sudo: both apply and release must already be permitted non-interactively.
-    for limit_w in [apply_target_w, pre_default_w] {
-        backend
-            .check_sudo_permission(limit_w)
-            .map_err(|reason| refuse(SmokeStage::SudoPermission, reason))?;
-    }
-    let _ = writeln!(out, "sudo -n permits apply and release commands");
-
-    // Apply.
-    let _ = writeln!(out, "Applying relay brake...");
-    if let Err(err) = backend.actuator().apply_emergency_brake(BRAKE_FRACTION) {
-        // The command may have partially run; observe before reporting.
-        return Err(fail_after_mutation(
-            backend,
-            &uuid,
-            SmokeStage::Apply,
-            actuator_reason(&err),
-            pre_default_w,
-            out,
-        ));
-    }
-    let (applied_current, _) = backend.actuator().query_power_limits_w();
-    let _ = writeln!(out, "Post-apply current limit: {}", fmt_w(applied_current));
-    let applied_current_w = match applied_current {
-        Some(w) if within_tolerance(w, apply_target_w) => w,
-        observed => {
-            return Err(fail_after_mutation(
-                backend,
-                &uuid,
-                SmokeStage::ApplyObservation,
-                format!(
-                    "expected {apply_target_w} W (+/-{BRAKE_MATCH_TOLERANCE_W}), observed {}",
-                    fmt_w(observed)
-                ),
-                pre_default_w,
-                out,
-            ));
-        }
-    };
-
-    // Healthy streak before release — same hysteresis the supervisor uses.
-    for n in 1..=release_ok_streak {
-        if let Err(reason) = backend.observe_healthy_sample() {
-            return Err(fail_after_mutation(
-                backend,
-                &uuid,
-                SmokeStage::HealthyStreak,
-                format!("sample {n}/{release_ok_streak} not healthy: {reason}"),
-                pre_default_w,
-                out,
-            ));
-        }
-        let _ = writeln!(out, "Healthy real sample {n}/{release_ok_streak}");
-    }
-
-    // Release and observe.
-    let _ = writeln!(out, "Releasing relay brake...");
-    if let Err(err) = backend.actuator().release_emergency_brake() {
-        return Err(fail_after_mutation(
-            backend,
-            &uuid,
-            SmokeStage::Release,
-            actuator_reason(&err),
-            pre_default_w,
-            out,
-        ));
-    }
-    let (released_current, _) = backend.actuator().query_power_limits_w();
-    let _ = writeln!(
-        out,
-        "Post-release current limit: {}",
-        fmt_w(released_current)
-    );
-    let released_current_w = match released_current {
-        Some(w) if within_tolerance(w, pre_default_w) => w,
-        observed => {
-            return Err(fail_after_mutation(
-                backend,
-                &uuid,
-                SmokeStage::ReleaseObservation,
-                format!(
-                    "expected default {pre_default_w} W (+/-{BRAKE_MATCH_TOLERANCE_W}), observed {}",
-                    fmt_w(observed)
-                ),
-                pre_default_w,
-                out,
-            ));
-        }
-    };
+    let applied_current_w = smoke.apply_and_observe(target_w)?;
+    smoke.healthy_streak(release_ok_streak)?;
+    let released_current_w = smoke.release_and_observe()?;
 
     Ok(SmokeReport {
-        uuid,
+        uuid: smoke.uuid,
         pre_current_w,
-        pre_default_w,
-        apply_target_w,
+        pre_default_w: smoke.default_w,
+        apply_target_w: target_w,
         applied_current_w,
         healthy_streak: release_ok_streak,
         released_current_w,
     })
 }
 
-fn actuator_reason(err: &ActuatorError) -> String {
-    format!("actuator error: {err:?}")
-}
-
-fn fmt_w(w: Option<u32>) -> String {
-    w.map_or("unreadable".to_string(), |w| format!("{w} W"))
-}
-
-/// Attempt one cleanup release after a post-apply failure and verify it.
-fn fail_after_mutation<B: ActuationSmokeBackend>(
-    backend: &mut B,
-    uuid: &str,
-    stage: SmokeStage,
-    reason: String,
+/// One in-flight smoke run: the backend plus the facts every stage shares.
+struct Smoke<'a, B: ActuationSmokeBackend> {
+    backend: &'a mut B,
+    uuid: String,
+    /// Device default in watts; set by [`Self::check_pre_state`].
     default_w: u32,
-    out: &mut dyn Write,
-) -> SmokeFailure {
-    debug_assert!(stage.after_mutation());
-    let _ = writeln!(out, "FAILURE at {}: {reason}", stage.as_str());
-    let (before, _) = backend.actuator().query_power_limits_w();
-    let cleanup = match before {
-        Some(w) if within_tolerance(w, default_w) => {
-            let _ = writeln!(out, "Cleanup: device already at default ({w} W)");
-            CleanupOutcome::Restored { current_w: w }
-        }
-        _ => {
-            let _ = writeln!(out, "Cleanup: attempting release...");
-            match backend.actuator().release_emergency_brake() {
-                Ok(()) => {
-                    let (after, _) = backend.actuator().query_power_limits_w();
-                    match after {
-                        Some(w) if within_tolerance(w, default_w) => {
-                            let _ = writeln!(out, "Cleanup: restored default ({w} W)");
-                            CleanupOutcome::Restored { current_w: w }
-                        }
-                        observed => CleanupOutcome::Failed {
-                            reason: format!(
-                                "release ran but limit is {} not default {default_w} W",
-                                fmt_w(observed)
-                            ),
-                            current_w: observed,
-                        },
-                    }
-                }
-                Err(err) => CleanupOutcome::Failed {
-                    reason: actuator_reason(&err),
-                    current_w: before,
-                },
-            }
-        }
-    };
-    if let CleanupOutcome::Failed { reason, .. } = &cleanup {
-        let _ = writeln!(
-            out,
-            "CLEANUP FAILED: {reason}. Operator recovery: {}",
-            recovery_command(uuid, default_w)
-        );
+    out: &'a mut dyn Write,
+}
+
+impl<B: ActuationSmokeBackend> Smoke<'_, B> {
+    fn limits(&self) -> (Option<u32>, Option<u32>) {
+        self.backend.actuator().query_power_limits_w()
     }
-    SmokeFailure {
-        stage,
-        reason,
-        cleanup,
+
+    /// Require the device at its default, owned by nobody. Returns
+    /// `(pre_current_w, brake_target_w)` and records the default.
+    fn check_pre_state(&mut self) -> Result<(u32, u32), SmokeFailure> {
+        let (current, default) = self.limits();
+        let _ = writeln!(
+            self.out,
+            "Pre-test power limits: current={} default={}",
+            fmt_w(current),
+            fmt_w(default)
+        );
+        let (current_w, default_w) = match classify_power_limit(current, default, BRAKE_FRACTION) {
+            PowerLimitObservation::AtOrAboveDefault {
+                current_w,
+                default_w,
+            } if current_w > 0 && default_w > 0 => (current_w, default_w),
+            PowerLimitObservation::AtOrAboveDefault { .. } => {
+                return Err(refuse(
+                    SmokeStage::PreState,
+                    "NVML reported a non-positive power limit",
+                ));
+            }
+            PowerLimitObservation::Unreadable => {
+                return Err(refuse(
+                    SmokeStage::PreState,
+                    "current/default power limit unreadable or brake target ambiguous",
+                ));
+            }
+            PowerLimitObservation::RelayOwnedBrake(m) => {
+                return Err(refuse(
+                    SmokeStage::PreState,
+                    format!(
+                        "a relay-owned brake is already engaged (current={} W, default={} W); recover with `{}` before re-running",
+                        m.current_w,
+                        m.default_w,
+                        recovery_command(&self.uuid, m.default_w)
+                    ),
+                ));
+            }
+            PowerLimitObservation::ForeignSubDefaultCap {
+                current_w,
+                default_w,
+                ..
+            } => {
+                return Err(refuse(
+                    SmokeStage::PreState,
+                    format!(
+                        "foreign sub-default power cap (current={current_w} W, default={default_w} W); refusing to take ownership"
+                    ),
+                ));
+            }
+        };
+        let target_w = unambiguous_brake_target(default_w, BRAKE_FRACTION)
+            .ok_or_else(|| refuse(SmokeStage::PreState, "brake target is ambiguous"))?;
+        self.default_w = default_w;
+        let _ = writeln!(
+            self.out,
+            "Apply target: {target_w} W (default x {BRAKE_FRACTION})"
+        );
+        let _ = writeln!(
+            self.out,
+            "Operator recovery if this run is interrupted: {}",
+            recovery_command(&self.uuid, default_w)
+        );
+        Ok((current_w, target_w))
+    }
+
+    /// Both the apply and the release plan must be the validated scoped path.
+    fn check_command_plans(&mut self, target_w: u32) -> Result<(), SmokeFailure> {
+        for limit_w in [target_w, self.default_w] {
+            let plan = self
+                .backend
+                .planned_power_limit_command(limit_w)
+                .ok_or_else(|| refuse(SmokeStage::CommandPlan, "actuator plans no command"))?;
+            validate_scoped_plan(&plan, &self.uuid, limit_w)
+                .map_err(|reason| refuse(SmokeStage::CommandPlan, reason))?;
+            let _ = writeln!(
+                self.out,
+                "Planned command ({limit_w} W): timeout {}",
+                plan.join(" ")
+            );
+        }
+        Ok(())
+    }
+
+    /// Both apply and release must already be permitted non-interactively.
+    fn check_sudo(&mut self, target_w: u32) -> Result<(), SmokeFailure> {
+        for limit_w in [target_w, self.default_w] {
+            self.backend
+                .check_sudo_permission(limit_w)
+                .map_err(|reason| refuse(SmokeStage::SudoPermission, reason))?;
+        }
+        let _ = writeln!(self.out, "sudo -n permits apply and release commands");
+        Ok(())
+    }
+
+    /// Apply the brake and require the read-back within tolerance of target.
+    fn apply_and_observe(&mut self, target_w: u32) -> Result<u32, SmokeFailure> {
+        let _ = writeln!(self.out, "Applying relay brake...");
+        if let Err(err) = self
+            .backend
+            .actuator()
+            .apply_emergency_brake(BRAKE_FRACTION)
+        {
+            // The command may have partially run; observe before reporting.
+            return Err(self.fail_after_mutation(SmokeStage::Apply, actuator_reason(&err)));
+        }
+        let (observed, _) = self.limits();
+        let _ = writeln!(self.out, "Post-apply current limit: {}", fmt_w(observed));
+        within_tolerance(observed, target_w).ok_or_else(|| {
+            self.fail_after_mutation(
+                SmokeStage::ApplyObservation,
+                format!(
+                    "expected {target_w} W (+/-{BRAKE_MATCH_TOLERANCE_W}), observed {}",
+                    fmt_w(observed)
+                ),
+            )
+        })
+    }
+
+    /// Require `streak` consecutive real `Ok` samples — the supervisor's
+    /// release hysteresis.
+    fn healthy_streak(&mut self, streak: u32) -> Result<(), SmokeFailure> {
+        for n in 1..=streak {
+            if let Err(reason) = self.backend.observe_healthy_sample() {
+                return Err(self.fail_after_mutation(
+                    SmokeStage::HealthyStreak,
+                    format!("sample {n}/{streak} not healthy: {reason}"),
+                ));
+            }
+            let _ = writeln!(self.out, "Healthy real sample {n}/{streak}");
+        }
+        Ok(())
+    }
+
+    /// Release the brake and require the read-back within tolerance of default.
+    fn release_and_observe(&mut self) -> Result<u32, SmokeFailure> {
+        let _ = writeln!(self.out, "Releasing relay brake...");
+        if let Err(err) = self.backend.actuator().release_emergency_brake() {
+            return Err(self.fail_after_mutation(SmokeStage::Release, actuator_reason(&err)));
+        }
+        let (observed, _) = self.limits();
+        let _ = writeln!(self.out, "Post-release current limit: {}", fmt_w(observed));
+        within_tolerance(observed, self.default_w).ok_or_else(|| {
+            self.fail_after_mutation(
+                SmokeStage::ReleaseObservation,
+                format!(
+                    "expected default {} W (+/-{BRAKE_MATCH_TOLERANCE_W}), observed {}",
+                    self.default_w,
+                    fmt_w(observed)
+                ),
+            )
+        })
+    }
+
+    /// Record a post-apply failure, attempt one verified cleanup, and name the
+    /// operator recovery when the device cannot be confirmed at default.
+    fn fail_after_mutation(&mut self, stage: SmokeStage, reason: String) -> SmokeFailure {
+        debug_assert!(stage.after_mutation());
+        let _ = writeln!(self.out, "FAILURE at {}: {reason}", stage.as_str());
+        let cleanup = self.cleanup();
+        if let CleanupOutcome::Failed { reason, .. } = &cleanup {
+            let _ = writeln!(
+                self.out,
+                "CLEANUP FAILED: {reason}. Operator recovery: {}",
+                recovery_command(&self.uuid, self.default_w)
+            );
+        }
+        SmokeFailure {
+            stage,
+            reason,
+            cleanup,
+        }
+    }
+
+    /// One release attempt through the production actuator, then a read-back.
+    /// The actuator refuses limits it does not own, so a foreign wattage ends
+    /// in [`CleanupOutcome::Failed`] by design.
+    fn cleanup(&mut self) -> CleanupOutcome {
+        let (before, _) = self.limits();
+        if let Some(w) = within_tolerance(before, self.default_w) {
+            let _ = writeln!(self.out, "Cleanup: device already at default ({w} W)");
+            return CleanupOutcome::Restored { current_w: w };
+        }
+        let _ = writeln!(self.out, "Cleanup: attempting release...");
+        if let Err(err) = self.backend.actuator().release_emergency_brake() {
+            return CleanupOutcome::Failed {
+                reason: actuator_reason(&err),
+                current_w: before,
+            };
+        }
+        let (after, _) = self.limits();
+        match within_tolerance(after, self.default_w) {
+            Some(w) => {
+                let _ = writeln!(self.out, "Cleanup: restored default ({w} W)");
+                CleanupOutcome::Restored { current_w: w }
+            }
+            None => CleanupOutcome::Failed {
+                reason: format!(
+                    "release ran but limit is {} not default {} W",
+                    fmt_w(after),
+                    self.default_w
+                ),
+                current_w: after,
+            },
+        }
     }
 }
 
@@ -548,7 +566,9 @@ mod tests {
 
     const UUID: &str = "GPU-12345678-1234-1234-1234-123456789abc";
 
-    /// Scripted fake: limits move on apply/release unless overridden.
+    /// Scripted fake that mirrors `NvmlActuator`'s ownership rules: apply
+    /// moves the limit to the brake target; release restores default only when
+    /// the current limit is the relay's own brake (otherwise it refuses).
     struct ScriptedActuator {
         state: Mutex<ScriptState>,
     }
@@ -574,9 +594,10 @@ mod tests {
             if s.fail_apply {
                 return Err(ActuatorError::CommandFailed("apply boom".into()));
             }
+            let default_w = s.default_w.ok_or(ActuatorError::PowerLimitUnavailable)?;
             s.current_w = match s.apply_lands_on {
                 Some(forced) => forced,
-                None => Some(s.default_w.unwrap() / 2),
+                None => Some(default_w / 2),
             };
             Ok(())
         }
@@ -585,6 +606,15 @@ mod tests {
             s.release_calls += 1;
             if s.fail_release {
                 return Err(ActuatorError::CommandFailed("release boom".into()));
+            }
+            // Same gate as production `plan_brake_release`.
+            match classify_power_limit(s.current_w, s.default_w, BRAKE_FRACTION) {
+                PowerLimitObservation::RelayOwnedBrake(_) => {}
+                _ => {
+                    return Err(ActuatorError::CommandFailed(
+                        "current power limit does not match relay brake; refusing restore".into(),
+                    ));
+                }
             }
             s.current_w = match s.release_lands_on {
                 Some(forced) => forced,
@@ -692,20 +722,27 @@ mod tests {
         (result, String::from_utf8(out).unwrap())
     }
 
+    fn args(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A refusal names its stage and never touched the actuator.
     fn assert_refused(backend: &FakeBackend, failure: &SmokeFailure, stage: SmokeStage) {
         assert_eq!(failure.stage, stage);
         assert_eq!(failure.cleanup, CleanupOutcome::NotNeeded);
-        assert_eq!(backend.apply_calls(), 0, "refusal must not apply");
-        assert_eq!(backend.release_calls(), 0, "refusal must not release");
+        assert_eq!(
+            (backend.apply_calls(), backend.release_calls()),
+            (0, 0),
+            "refusal must not apply or release"
+        );
     }
 
     #[test]
     fn happy_path_applies_waits_for_streak_releases_and_records_every_observation() {
         let mut backend = FakeBackend::healthy(400, 400);
-        let (result, log) = run(&mut backend);
-        let report = result.unwrap();
+        let (result, _) = run(&mut backend);
         assert_eq!(
-            report,
+            result.unwrap(),
             SmokeReport {
                 uuid: UUID.to_string(),
                 pre_current_w: 400,
@@ -716,11 +753,21 @@ mod tests {
                 released_current_w: 400,
             }
         );
-        assert_eq!(backend.apply_calls(), 1);
-        assert_eq!(backend.release_calls(), 1);
-        assert_eq!(backend.health_calls, 3);
-        assert_eq!(backend.current_w(), Some(400));
-        // The log carries the recovery command before apply and the scoped plan.
+        assert_eq!(
+            (
+                backend.apply_calls(),
+                backend.release_calls(),
+                backend.health_calls,
+                backend.current_w()
+            ),
+            (1, 1, 3, Some(400))
+        );
+    }
+
+    #[test]
+    fn log_carries_recovery_before_apply_and_both_scoped_plans() {
+        let mut backend = FakeBackend::healthy(400, 400);
+        let (_, log) = run(&mut backend);
         let recovery_pos = log.find("Operator recovery").unwrap();
         let apply_pos = log.find("Applying relay brake").unwrap();
         assert!(recovery_pos < apply_pos);
@@ -762,33 +809,44 @@ mod tests {
             let (result, _) = run(&mut backend);
             assert_refused(&backend, &result.unwrap_err(), SmokeStage::PreState);
         }
-        // Tiny defaults make the brake band ambiguous -> Unreadable -> refuse.
+    }
+
+    #[test]
+    fn tiny_default_makes_the_brake_band_ambiguous_and_refuses() {
         let mut backend = FakeBackend::healthy(8, 8);
         let (result, _) = run(&mut backend);
         assert_refused(&backend, &result.unwrap_err(), SmokeStage::PreState);
     }
 
     #[test]
-    fn zero_streak_refuses() {
+    fn zero_streak_is_a_config_refusal() {
         let mut backend = FakeBackend::healthy(400, 400);
         let mut out = Vec::new();
         let failure = run_actuation_smoke(&mut backend, UUID, 0, &mut out).unwrap_err();
-        assert_refused(&backend, &failure, SmokeStage::PreState);
+        assert_refused(&backend, &failure, SmokeStage::Config);
     }
 
     #[test]
-    fn missing_or_unscoped_plan_refuses() {
+    fn missing_plan_refuses() {
         let mut backend = FakeBackend::healthy(400, 400);
         backend.plan_override = Some(None);
         let (result, _) = run(&mut backend);
         assert_refused(&backend, &result.unwrap_err(), SmokeStage::CommandPlan);
+    }
 
-        let unscoped = ["-k", "2", "5s", "sudo", "-n", "nvidia-smi", "-pl", "200"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+    #[test]
+    fn unscoped_plan_refuses() {
         let mut backend = FakeBackend::healthy(400, 400);
-        backend.plan_override = Some(Some(unscoped));
+        backend.plan_override = Some(Some(args(&[
+            "-k",
+            "2",
+            "5s",
+            "sudo",
+            "-n",
+            "nvidia-smi",
+            "-pl",
+            "200",
+        ])));
         let (result, _) = run(&mut backend);
         let failure = result.unwrap_err();
         assert_refused(&backend, &failure, SmokeStage::CommandPlan);
@@ -815,29 +873,35 @@ mod tests {
     }
 
     #[test]
-    fn unexpected_post_apply_limit_triggers_cleanup_release() {
+    fn unexpected_post_apply_limit_is_not_force_restored() {
+        // 150 W is neither the brake nor the default: production refuses to
+        // own it, so cleanup must report failure and defer to the operator.
         let mut backend =
             FakeBackend::healthy(400, 400).with_state(|s| s.apply_lands_on = Some(Some(150)));
         let (result, log) = run(&mut backend);
         let failure = result.unwrap_err();
         assert_eq!(failure.stage, SmokeStage::ApplyObservation);
-        assert_eq!(failure.cleanup, CleanupOutcome::Restored { current_w: 400 });
-        assert_eq!(backend.release_calls(), 1);
+        assert!(matches!(
+            failure.cleanup,
+            CleanupOutcome::Failed {
+                current_w: Some(150),
+                ..
+            }
+        ));
         assert_eq!(backend.health_calls, 0, "no streak after a bad apply");
-        assert!(log.contains("Cleanup: restored default"));
+        assert!(log.contains(&recovery_command(UUID, 400)));
     }
 
     #[test]
     fn unhealthy_sample_in_streak_releases_and_fails() {
         let mut backend = FakeBackend::healthy(400, 400);
         backend.health = VecDeque::from([Ok(()), Err("Critical(temp)".to_string())]);
-        let (result, _) = run(&mut backend);
+        let (result, log) = run(&mut backend);
         let failure = result.unwrap_err();
         assert_eq!(failure.stage, SmokeStage::HealthyStreak);
         assert!(failure.reason.contains("sample 2/3"));
         assert_eq!(failure.cleanup, CleanupOutcome::Restored { current_w: 400 });
-        assert_eq!(backend.release_calls(), 1);
-        assert_eq!(backend.current_w(), Some(400));
+        assert!(log.contains("Cleanup: restored default"));
     }
 
     #[test]
@@ -864,7 +928,7 @@ mod tests {
         let (result, _) = run(&mut backend);
         let failure = result.unwrap_err();
         assert_eq!(failure.stage, SmokeStage::ReleaseObservation);
-        // Cleanup release lands on 350 again -> cannot confirm default.
+        // 350 W is a foreign cap now; the actuator refuses to touch it.
         assert!(matches!(
             failure.cleanup,
             CleanupOutcome::Failed {
@@ -882,36 +946,27 @@ mod tests {
         });
         let (result, _) = run(&mut backend);
         let report = result.unwrap();
-        assert_eq!(report.applied_current_w, 202);
-        assert_eq!(report.released_current_w, 398);
+        assert_eq!(
+            (report.applied_current_w, report.released_current_w),
+            (202, 398)
+        );
     }
 
     #[test]
-    fn scoped_plan_validator_rejects_every_unscoped_shape() {
-        let ok: Vec<String> = ["sudo", "-n", "nvidia-smi", "-i", UUID, "-pl", "200"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+    fn scoped_plan_validator_accepts_the_canonical_form_only_at_the_planned_limit() {
+        let ok = args(&["sudo", "-n", "nvidia-smi", "-i", UUID, "-pl", "200"]);
         validate_scoped_plan(&ok, UUID, 200).unwrap();
         assert!(validate_scoped_plan(&ok, UUID, 201).is_err());
         assert!(validate_scoped_plan(&ok, "GPU-other", 200).is_err());
+    }
 
-        let reordered: Vec<String> = ["nvidia-smi", "-pl", "200", "-i", UUID]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+    #[test]
+    fn scoped_plan_validator_rejects_reordered_doubled_and_non_smi_plans() {
+        let reordered = args(&["nvidia-smi", "-pl", "200", "-i", UUID]);
         assert!(validate_scoped_plan(&reordered, UUID, 200).is_err());
-
-        let doubled: Vec<String> = ["nvidia-smi", "-i", UUID, "-pl", "200", "-pl", "300"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let doubled = args(&["nvidia-smi", "-i", UUID, "-pl", "200", "-pl", "300"]);
         assert!(validate_scoped_plan(&doubled, UUID, 200).is_err());
-
-        let no_smi: Vec<String> = ["echo", "-i", UUID, "-pl", "200"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let no_smi = args(&["echo", "-i", UUID, "-pl", "200"]);
         assert!(validate_scoped_plan(&no_smi, UUID, 200).is_err());
     }
 

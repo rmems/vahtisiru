@@ -71,7 +71,7 @@ jobs:
           GPU_UUID: ${{ inputs.gpu_uuid }}
         run: |
           set -euo pipefail
-          cargo run --locked --bin vahtisiru -- \
+          cargo run --release --locked --bin vahtisiru -- \
             --gpu-hardware-actuation-smoke \
             --gpu-hardware-actuation-uuid "${GPU_UUID}"
 
