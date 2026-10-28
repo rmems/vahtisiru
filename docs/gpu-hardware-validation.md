@@ -139,7 +139,10 @@ job still leaves evidence of the device state.
 
 ### Failure, cleanup, and operator recovery
 
-An **unhealthy sample during the streak** is the one failure that does *not*
+Each streak sample's NVML read is bounded by the same 2 s timeout the
+supervisor uses; a read that does not return in time counts as unhealthy.
+An **unhealthy sample during the streak** (including that timeout) is the one
+failure that does *not*
 release: the brake exists for exactly that situation, so the smoke leaves it
 engaged, reports `BRAKE HELD`, and fails. A supervisor started afterwards
 adopts the relay-owned brake and releases it through normal hysteresis;

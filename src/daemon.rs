@@ -437,7 +437,22 @@ impl ActuationSmokeBackend for NvmlActuationSmokeBackend {
 
     fn observe_healthy_sample(&mut self) -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(self.sample_cadence_ms));
-        let raw = self.bridge.acquire_raw(false);
+        // Bound the driver call like the supervisor's NvmlGate does: NVML
+        // offers no safe interruption, so a wedged read is abandoned (the
+        // worker thread is left to return on its own) and the sample is
+        // treated as unhealthy, which holds the brake rather than blocking
+        // the smoke's failure handling forever.
+        let bridge = self.bridge.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(bridge.acquire_raw(false));
+        });
+        let raw = rx.recv_timeout(NVML_TIMEOUT).map_err(|_| {
+            format!(
+                "NVML telemetry read exceeded {} ms; driver may be wedged",
+                NVML_TIMEOUT.as_millis()
+            )
+        })?;
         let frame = assess_with_clock(&raw, unix_now_ms(), self.sample_cadence_ms, &mut self.clock);
         match instant_status_with_policy(&frame, &self.policy) {
             (SafetyStatus::Ok, false) => {
