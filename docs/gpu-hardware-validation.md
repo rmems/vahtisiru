@@ -78,8 +78,14 @@ non-interactive sudoers rule that permits **only** the UUID-scoped
 power-limit form the relay uses, for example:
 
 ```text
-runner ALL=(root) NOPASSWD: /usr/bin/nvidia-smi -i GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx -pl [0-9]*
+runner ALL=(root) NOPASSWD: /usr/bin/nvidia-smi ^-i GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx -pl [0-9]+$
 ```
+
+Use the anchored regular-expression form (sudo ≥ 1.9.10). A shell-style
+wildcard such as `-pl [0-9]*` matches across word boundaries in sudoers, so
+it would also permit `-pl 2 <anything>`; the regex above matches exactly one
+integer wattage and nothing after it. On older sudo, enumerate the exact
+apply and default wattages instead of using a wildcard.
 
 The smoke checks this rule with `sudo -n -l -- nvidia-smi -i <UUID> -pl <W>`
 for both the apply and the release wattage **before** running anything.
@@ -133,10 +139,15 @@ job still leaves evidence of the device state.
 
 ### Failure, cleanup, and operator recovery
 
-Any failure after the brake is applied — unexpected post-apply limit, an
-unhealthy sample during the streak, a release error, or a post-release limit
-that is not the default — triggers one cleanup release through the same
-production actuator, followed by a read-back. That actuator deliberately
+An **unhealthy sample during the streak** is the one failure that does *not*
+release: the brake exists for exactly that situation, so the smoke leaves it
+engaged, reports `BRAKE HELD`, and fails. A supervisor started afterwards
+adopts the relay-owned brake and releases it through normal hysteresis;
+otherwise release it manually only once telemetry is healthy.
+
+Any other failure after the brake is applied — unexpected post-apply limit, a
+release error, or a post-release limit that is not the default — triggers one
+cleanup release through the same production actuator, followed by a read-back. That actuator deliberately
 refuses to restore a limit it does not recognise as the relay's own brake
 (a foreign or unexpected wattage means something else set it), so in those
 cases cleanup reports failure and hands the decision to the operator rather

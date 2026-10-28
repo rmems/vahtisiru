@@ -475,6 +475,16 @@ fn run_gpu_hardware_actuation_smoke(
     if cli.force_software_only {
         return Err("actuation smoke requires real NVML; --force-software-only is refused".into());
     }
+    // Same operator-input validation as `prepare`, before any lock or NVML
+    // call: a step interval above the acquisition limit would brake the device
+    // and then classify every streak sample as stale.
+    let config = cli.safety_policy_config();
+    config.resolve(None)?;
+    if cli.step_interval_ms > config.max_acquisition_interval_ms
+        || cli.step_interval_ms.saturating_mul(10) > config.max_sample_age_ms
+    {
+        return Err("step interval exceeds safety acquisition limit or ten-tick evaluation exceeds sample-age limit".into());
+    }
     if let Ok(sha) = std::env::var("GITHUB_SHA") {
         println!("Trusted commit: {sha}");
     }
@@ -495,9 +505,7 @@ fn run_gpu_hardware_actuation_smoke(
     // Resolve the policy against the device default like the supervisor does,
     // so "healthy" means the same thing here as in production.
     let (_, default_w) = actuator.query_power_limits_w();
-    let policy = cli
-        .safety_policy_config()
-        .resolve(default_w.map(|w| w as f32))?;
+    let policy = config.resolve(default_w.map(|w| w as f32))?;
     println!(
         "Validation scope: ACTUATION — applies and releases the relay brake on {} (release_ok_streak={})",
         target.uuid(),

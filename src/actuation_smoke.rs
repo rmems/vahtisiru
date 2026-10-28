@@ -130,6 +130,14 @@ pub(crate) enum CleanupOutcome {
         /// Observed post-cleanup current limit in watts.
         current_w: u32,
     },
+    /// The brake was deliberately left engaged because telemetry was not
+    /// healthy; releasing would remove protection the device may need. A
+    /// supervisor started afterwards adopts and releases it through normal
+    /// hysteresis.
+    Held {
+        /// Observed current limit (the brake) in watts, if readable.
+        current_w: Option<u32>,
+    },
     /// Release failed or the post-cleanup limit is not at default. The
     /// operator must run the documented recovery procedure.
     Failed {
@@ -164,6 +172,11 @@ impl fmt::Display for SmokeFailure {
             CleanupOutcome::Restored { current_w } => {
                 write!(f, " (cleanup restored default; current={current_w} W)")
             }
+            CleanupOutcome::Held { current_w } => write!(
+                f,
+                " (BRAKE HELD: telemetry not healthy, limit left at {}; release only once the device is healthy)",
+                fmt_w(*current_w)
+            ),
             CleanupOutcome::Failed { reason, current_w } => write!(
                 f,
                 " (CLEANUP FAILED: {reason}; last observed current={}; run the operator recovery procedure)",
@@ -304,7 +317,9 @@ pub(crate) fn run_actuation_smoke<B: ActuationSmokeBackend>(
     }
     let uuid = backend.resolved_uuid().to_string();
     let _ = writeln!(out, "Resolved GPU UUID: {uuid}");
-    if uuid != expected_uuid {
+    // NVML UUIDs are hex; `is_valid_gpu_uuid` accepts either case, so compare
+    // the same way rather than refusing an operator's capitalised copy.
+    if !uuid.eq_ignore_ascii_case(expected_uuid) {
         return Err(refuse(
             SmokeStage::Identity,
             format!("operator confirmed {expected_uuid} but NVML index 0 resolved to {uuid}"),
@@ -474,10 +489,9 @@ impl<B: ActuationSmokeBackend> Smoke<'_, B> {
     fn healthy_streak(&mut self, streak: u32) -> Result<(), SmokeFailure> {
         for n in 1..=streak {
             if let Err(reason) = self.backend.observe_healthy_sample() {
-                return Err(self.fail_after_mutation(
-                    SmokeStage::HealthyStreak,
-                    format!("sample {n}/{streak} not healthy: {reason}"),
-                ));
+                return Err(
+                    self.fail_holding_brake(format!("sample {n}/{streak} not healthy: {reason}"))
+                );
             }
             let _ = writeln!(self.out, "Healthy real sample {n}/{streak}");
         }
@@ -521,6 +535,30 @@ impl<B: ActuationSmokeBackend> Smoke<'_, B> {
             stage,
             reason,
             cleanup,
+        }
+    }
+
+    /// An unhealthy sample while braked is exactly the situation the brake
+    /// exists for: do **not** release. Leave the relay-owned brake engaged,
+    /// report it, and let the operator (or a later supervisor, which adopts a
+    /// relay-owned brake at startup) release once telemetry is healthy.
+    fn fail_holding_brake(&mut self, reason: String) -> SmokeFailure {
+        let _ = writeln!(
+            self.out,
+            "FAILURE at {}: {reason}",
+            SmokeStage::HealthyStreak.as_str()
+        );
+        let (current_w, _) = self.limits();
+        let _ = writeln!(
+            self.out,
+            "BRAKE HELD: telemetry not healthy; leaving limit at {}. Release only once healthy: {}",
+            fmt_w(current_w),
+            recovery_command(&self.uuid, self.default_w)
+        );
+        SmokeFailure {
+            stage: SmokeStage::HealthyStreak,
+            reason,
+            cleanup: CleanupOutcome::Held { current_w },
         }
     }
 
@@ -893,15 +931,34 @@ mod tests {
     }
 
     #[test]
-    fn unhealthy_sample_in_streak_releases_and_fails() {
+    fn unhealthy_sample_in_streak_holds_the_brake_and_fails() {
         let mut backend = FakeBackend::healthy(400, 400);
         backend.health = VecDeque::from([Ok(()), Err("Critical(temp)".to_string())]);
         let (result, log) = run(&mut backend);
         let failure = result.unwrap_err();
         assert_eq!(failure.stage, SmokeStage::HealthyStreak);
         assert!(failure.reason.contains("sample 2/3"));
-        assert_eq!(failure.cleanup, CleanupOutcome::Restored { current_w: 400 });
-        assert!(log.contains("Cleanup: restored default"));
+        // Unhealthy while braked: protection stays on, nothing is released.
+        assert_eq!(
+            failure.cleanup,
+            CleanupOutcome::Held {
+                current_w: Some(200)
+            }
+        );
+        assert_eq!(
+            (backend.release_calls(), backend.current_w()),
+            (0, Some(200))
+        );
+        assert!(log.contains("BRAKE HELD"));
+        assert!(failure.to_string().contains("BRAKE HELD"));
+    }
+
+    #[test]
+    fn operator_uuid_matches_case_insensitively() {
+        let mut backend = FakeBackend::healthy(400, 400);
+        let mut out = Vec::new();
+        let upper = UUID.to_ascii_uppercase();
+        assert!(run_actuation_smoke(&mut backend, &upper, 3, &mut out).is_ok());
     }
 
     #[test]
