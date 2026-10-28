@@ -1256,3 +1256,28 @@ async fn gate_busy_during_in_flight_release_reapplies_on_completion() {
     assert_eq!(report.actuation, Some(ActuatorOutcome::Applied));
     assert_eq!(hw(&fake), hw_is(true, 2, 1));
 }
+
+/// A release worker that skipped the driver (superseded before it started)
+/// is reconciled without recording an outcome: the flag clears, the brake
+/// stays engaged, and no restore was issued.
+#[tokio::test]
+async fn skipped_release_worker_records_nothing() {
+    let fake = Arc::new(FakeActuator::new());
+    fake.apply_emergency_brake(BRAKE_FRACTION).unwrap();
+    let mut sup = harness().actuator(fake.clone()).build();
+    sup.seed_startup_brake(Some(200), Some(400));
+    sup.release_superseded.store(true, Ordering::Release);
+    sup.release_task = Some(tokio::task::spawn_blocking(|| {
+        Err(ActuatorError::CommandFailed(RELEASE_SKIPPED.into()))
+    }));
+    settle(&sup).await;
+
+    let outcome = sup.reconcile_finished(ActuationKind::Release).await;
+    assert_eq!(outcome, None);
+    assert!(!sup.release_superseded.load(Ordering::Acquire));
+    assert!(sup.release_task.is_none());
+    assert_eq!(
+        (sup.snapshot().brake_engaged, hw(&fake)),
+        (true, hw_is(true, 1, 0))
+    );
+}
