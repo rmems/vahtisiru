@@ -137,7 +137,7 @@ impl GpuTarget {
 /// Validate an NVML physical-GPU UUID: a `GPU-` prefix followed by a canonical
 /// 8-4-4-4-12 lowercase-or-uppercase hex UUID. MIG / non-`GPU-` identities are
 /// rejected — this relay scopes a whole physical device, not a MIG slice.
-fn is_valid_gpu_uuid(uuid: &str) -> bool {
+pub(crate) fn is_valid_gpu_uuid(uuid: &str) -> bool {
     let Some(body) = uuid.strip_prefix("GPU-") else {
         return false;
     };
@@ -342,7 +342,7 @@ impl NvmlActuator {
     /// This is the single command-planning seam the mutation paths use, so the
     /// UUID scoping of a real apply/release is observable without a GPU or a
     /// subprocess. Pure and side-effect free.
-    fn planned_command(&self, limit_w: u32) -> Option<Vec<String>> {
+    pub(crate) fn planned_command(&self, limit_w: u32) -> Option<Vec<String>> {
         self.target
             .as_ref()
             .map(|target| power_limit_command_args(target, limit_w))

@@ -11,14 +11,21 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::sleep;
 
+use crate::actuation_smoke::{
+    ActuationSmokeBackend, run_actuation_smoke, sudo_foreign_uuid_probe_args,
+    sudo_permission_check_args, sudo_unscoped_probe_args,
+};
 use crate::cpu::{self, RelayMetrics};
-use crate::gpu::{GpuTarget, HardwareBridge, NvmlActuator};
+use crate::gpu::{GpuTarget, HardwareBridge, NvmlActuator, is_valid_gpu_uuid};
 use crate::nvml_gate::NvmlGate;
 use crate::publish::{
     AbsentPublisher, CorpusIpcPublisher, DEFAULT_IPC_ENDPOINT, DEFAULT_IPC_SESSION_ID, QueueConfig,
     QueueFullPolicy, SensoryPublisher,
 };
-use crate::safety::{SafetyActuator, SafetyMachine, SafetyPolicyConfig};
+use crate::safety::{
+    SafetyActuator, SafetyMachine, SafetyPolicy, SafetyPolicyConfig, SafetyStatus,
+    instant_status_with_policy,
+};
 use crate::shutdown::ShutdownReason;
 use crate::supervisor::{
     NVML_TIMEOUT, Supervisor, SupervisorConfig, SupervisorParts, monotonic_ms_clock,
@@ -128,17 +135,26 @@ pub struct SupervisorStart {
     _lock_guard: LockGuard,
 }
 
-/// Run the read-only smoke when its Clap option is present. Returns `false`
-/// when normal supervisor startup should continue.
+/// Run the read-only or maintainer-only actuation smoke when its Clap option
+/// is present. Returns `false` when normal supervisor startup should continue.
 #[doc(hidden)]
 pub fn run_gpu_hardware_smoke_if_requested() -> Result<bool, Box<dyn std::error::Error>> {
-    if !std::env::args_os().any(|arg| arg == "--gpu-hardware-smoke") {
+    if !std::env::args_os()
+        .any(|arg| arg == "--gpu-hardware-smoke" || arg == "--gpu-hardware-actuation-smoke")
+    {
         return Ok(false);
     }
 
     let cli = Cli::parse();
     if cli.gpu_hardware_smoke {
         run_gpu_hardware_smoke()?;
+        Ok(true)
+    } else if cli.gpu_hardware_actuation_smoke {
+        let expected_uuid = cli
+            .gpu_hardware_actuation_uuid
+            .clone()
+            .ok_or("--gpu-hardware-actuation-smoke requires --gpu-hardware-actuation-uuid")?;
+        run_gpu_hardware_actuation_smoke(&cli, &expected_uuid)?;
         Ok(true)
     } else {
         Ok(false)
@@ -150,14 +166,8 @@ pub fn run_gpu_hardware_smoke_if_requested() -> Result<bool, Box<dyn std::error:
 #[doc(hidden)]
 pub fn prepare() -> Result<SupervisorStart, Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    let config = cli.safety_policy_config();
     // Reject contradictory operator inputs before NVML, locks, ports or workers.
-    config.resolve(None)?;
-    if cli.step_interval_ms > config.max_acquisition_interval_ms
-        || cli.step_interval_ms > config.max_sample_age_ms
-    {
-        return Err("step interval exceeds safety acquisition limit or sample-age limit".into());
-    }
+    let config = cli.validated_safety_policy_config()?;
 
     // Block while a pre-rename instance still holds its legacy lock, then
     // acquire the process lock before any potentially blocking driver call.
@@ -320,22 +330,7 @@ pub async fn run(prepared: &mut SupervisorStart) -> Result<(), Box<dyn std::erro
 /// Perform an explicit, read-only validation of the same GPU adapters used by
 /// the supervisor. This path does not start the daemon or mutate power limits.
 fn run_gpu_hardware_smoke() -> Result<(), Box<dyn std::error::Error>> {
-    let list = std::process::Command::new("timeout")
-        .args(["-k", "2s", "3s", "nvidia-smi", "-L"])
-        .output()
-        .map_err(|error| {
-            std::io::Error::other(format!(
-                "could not execute `timeout -k 2s 3s nvidia-smi -L`: {error}"
-            ))
-        })?;
-    if !list.status.success() {
-        return Err(std::io::Error::other(format!(
-            "`nvidia-smi -L` exited with {}; NVIDIA driver/device unavailable",
-            list.status
-        ))
-        .into());
-    }
-    print!("{}", String::from_utf8_lossy(&list.stdout));
+    list_nvidia_devices()?;
 
     let target = GpuTarget::resolve()?;
     println!("GPU target UUID: {}", target.uuid());
@@ -387,6 +382,212 @@ fn run_gpu_hardware_smoke() -> Result<(), Box<dyn std::error::Error>> {
         default_w
     );
     println!("GPU hardware smoke PASSED (read-only)");
+    Ok(())
+}
+
+/// Run `timeout -k 2s 3s nvidia-smi -L` and echo it, so the job log records
+/// the driver's own view of the device inventory before any NVML call.
+fn list_nvidia_devices() -> Result<(), Box<dyn std::error::Error>> {
+    let list = std::process::Command::new("timeout")
+        .args(["-k", "2s", "3s", "nvidia-smi", "-L"])
+        .output()
+        .map_err(|error| {
+            std::io::Error::other(format!(
+                "could not execute `timeout -k 2s 3s nvidia-smi -L`: {error}"
+            ))
+        })?;
+    if !list.status.success() {
+        return Err(std::io::Error::other(format!(
+            "`nvidia-smi -L` exited with {}; NVIDIA driver/device unavailable",
+            list.status
+        ))
+        .into());
+    }
+    print!("{}", String::from_utf8_lossy(&list.stdout));
+    Ok(())
+}
+
+/// Production [`ActuationSmokeBackend`]: the same `GpuTarget`, `NvmlActuator`,
+/// and `HardwareBridge` the supervisor uses, plus a `sudo -l` permission probe.
+struct NvmlActuationSmokeBackend {
+    target: GpuTarget,
+    actuator: NvmlActuator,
+    bridge: HardwareBridge,
+    policy: SafetyPolicy,
+    clock: SampleClock,
+    sample_cadence_ms: u64,
+}
+
+impl ActuationSmokeBackend for NvmlActuationSmokeBackend {
+    fn resolved_uuid(&self) -> &str {
+        self.target.uuid()
+    }
+
+    fn planned_power_limit_command(&self, limit_w: u32) -> Option<Vec<String>> {
+        self.actuator.planned_command(limit_w)
+    }
+
+    fn check_sudo_permission(&self, limit_w: u32) -> Result<(), String> {
+        let args = sudo_permission_check_args(self.target.uuid(), limit_w);
+        let status = std::process::Command::new("timeout")
+            .args(&args)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .map_err(|e| format!("could not execute `timeout {}`: {e}", args.join(" ")))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "`sudo -n -l -- nvidia-smi -i {} -pl {limit_w}` exited with {status}; the sudoers rule must permit this exact command non-interactively",
+                self.target.uuid()
+            ))
+        }
+    }
+
+    fn check_sudo_denies_unscoped(&self, limit_w: u32) -> Result<(), String> {
+        // Two forms a correctly pinned rule must deny: no `-i` at all (a bare
+        // or `-pl *` grant) and `-i <some other UUID>` (a `-i GPU-*` wildcard).
+        for (label, args) in [
+            ("unscoped", sudo_unscoped_probe_args(limit_w)),
+            ("foreign-UUID", sudo_foreign_uuid_probe_args(limit_w)),
+        ] {
+            let status = std::process::Command::new("timeout")
+                .args(&args)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .map_err(|e| format!("could not execute `timeout {}`: {e}", args.join(" ")))?;
+            // `sudo -l <command>` exits 0 when permitted and 1 when the rule
+            // does not match. Only an explicit denial is acceptable; a timeout
+            // or any other status is ambiguous and fails closed.
+            match status.code() {
+                Some(1) => {}
+                Some(0) => {
+                    return Err(format!(
+                        "sudo permits the {label} form `{}`; the sudoers rule must be restricted to `-i {} -pl <W>`",
+                        args[7..].join(" "),
+                        self.target.uuid()
+                    ));
+                }
+                other => {
+                    return Err(format!(
+                        "{label} sudo probe `sudo -n -l -- {}` exited with {other:?}; cannot confirm the rule is scoped",
+                        args[7..].join(" ")
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn actuator(&self) -> &dyn SafetyActuator {
+        &self.actuator
+    }
+
+    fn observe_healthy_sample(&mut self) -> Result<(), String> {
+        std::thread::sleep(Duration::from_millis(self.sample_cadence_ms));
+        // Bound the driver call like the supervisor's NvmlGate does: NVML
+        // offers no safe interruption, so a wedged read is abandoned (the
+        // worker thread is left to return on its own) and the sample is
+        // treated as unhealthy, which holds the brake rather than blocking
+        // the smoke's failure handling forever.
+        let bridge = self.bridge.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(bridge.acquire_raw(false));
+        });
+        let raw = rx.recv_timeout(NVML_TIMEOUT).map_err(|_| {
+            format!(
+                "NVML telemetry read exceeded {} ms; driver may be wedged",
+                NVML_TIMEOUT.as_millis()
+            )
+        })?;
+        let frame = assess_with_clock(&raw, unix_now_ms(), self.sample_cadence_ms, &mut self.clock);
+        match instant_status_with_policy(&frame, &self.policy) {
+            (SafetyStatus::Ok, false) => {
+                println!(
+                    "  sample: temperature={:?} C power={:?} W source={:?}",
+                    frame.gpu_temp_c.value, frame.power_w.value, frame.source
+                );
+                Ok(())
+            }
+            (SafetyStatus::Ok, true) => Err("sample is simulated, not real NVML".into()),
+            (status, _) => Err(format!("{status:?}")),
+        }
+    }
+}
+
+/// Maintainer-only hardware actuation smoke (RM-1909). Applies and releases the
+/// relay brake on the operator-confirmed GPU through the production actuator,
+/// verifying every step. See `docs/gpu-hardware-validation.md`.
+fn run_gpu_hardware_actuation_smoke(
+    cli: &Cli,
+    expected_uuid: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !is_valid_gpu_uuid(expected_uuid) {
+        return Err(format!(
+            "--gpu-hardware-actuation-uuid {expected_uuid:?} is not a physical NVML GPU UUID (GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)"
+        )
+        .into());
+    }
+    if cli.force_software_only {
+        return Err("actuation smoke requires real NVML; --force-software-only is refused".into());
+    }
+    // Same operator-input validation as `prepare`, before any lock or NVML
+    // call: a step interval above the acquisition limit would brake the device
+    // and then classify every streak sample as stale.
+    let config = cli.validated_safety_policy_config()?;
+    if let Ok(sha) = std::env::var("GITHUB_SHA") {
+        println!("Trusted commit: {sha}");
+    }
+    // Take the supervisor's single-instance lock before touching the device.
+    // A running relay drives the same brake target; letting the smoke apply
+    // and release beneath it could lift a real brake mid-fault. Held until
+    // the smoke returns, including through cleanup.
+    check_legacy_lock(LEGACY_PROCESS_LOCK_PATH)
+        .map_err(|msg| format!("{msg} Stop the supervisor before the actuation smoke."))?;
+    let _lock_guard = try_acquire_lock(PROCESS_LOCK_PATH).map_err(|msg| {
+        format!("{msg} Stop the running vahtisiru supervisor before the actuation smoke.")
+    })?;
+    println!("Process lock held: {PROCESS_LOCK_PATH} (no supervisor is running)");
+    list_nvidia_devices()?;
+
+    let target = GpuTarget::resolve()?;
+    let actuator = NvmlActuator::new(Some(target.clone()));
+    // Resolve the policy against the device default like the supervisor does,
+    // so "healthy" means the same thing here as in production.
+    let (_, default_w) = actuator.query_power_limits_w();
+    let policy = config.resolve(default_w.map(|w| w as f32))?;
+    println!(
+        "Validation scope: ACTUATION — applies and releases the relay brake on {} (release_ok_streak={})",
+        target.uuid(),
+        cli.safety_release_ok_streak
+    );
+
+    let mut backend = NvmlActuationSmokeBackend {
+        bridge: HardwareBridge::new(Some(target.clone())),
+        target,
+        actuator,
+        policy,
+        clock: SampleClock::new(),
+        sample_cadence_ms: cli.step_interval_ms,
+    };
+    let mut stdout = io::stdout().lock();
+    let report = run_actuation_smoke(
+        &mut backend,
+        expected_uuid,
+        cli.safety_release_ok_streak,
+        &mut stdout,
+    )?;
+    println!(
+        "GPU actuation smoke PASSED: uuid={} pre_current={} W pre_default={} W apply_target={} W applied={} W healthy_streak={} released={} W cleanup=not_needed",
+        report.uuid,
+        report.pre_current_w,
+        report.pre_default_w,
+        report.apply_target_w,
+        report.applied_current_w,
+        report.healthy_streak,
+        report.released_current_w
+    );
     Ok(())
 }
 
@@ -522,8 +723,22 @@ struct Cli {
     step_interval_ms: u64,
 
     /// Validate read-only NVIDIA hardware access and exit without starting the supervisor.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "gpu_hardware_actuation_smoke")]
     gpu_hardware_smoke: bool,
+
+    /// MAINTAINER ONLY: apply and release the relay brake on real hardware, then exit.
+    /// Mutates the GPU power limit. Requires --gpu-hardware-actuation-uuid.
+    #[arg(long, requires = "gpu_hardware_actuation_uuid")]
+    gpu_hardware_actuation_smoke: bool,
+
+    /// Explicit confirmation of the GPU UUID the actuation smoke may mutate.
+    /// Must equal the UUID NVML index 0 resolves to.
+    #[arg(
+        long,
+        requires = "gpu_hardware_actuation_smoke",
+        value_name = "GPU-UUID"
+    )]
+    gpu_hardware_actuation_uuid: Option<String>,
 
     /// Force simulated idle telemetry (skip NVML). Documented estimates, not real sensors.
     /// Usable as a bare flag (`--force-software-only`) or with an explicit
@@ -573,6 +788,24 @@ fn parse_sensory_queue_capacity(s: &str) -> Result<usize, String> {
 }
 
 impl Cli {
+    /// The policy config, after rejecting contradictory operator inputs and a
+    /// step interval the safety policy cannot keep fresh. Shared by the
+    /// supervisor and the actuation smoke so the two cannot drift.
+    fn validated_safety_policy_config(
+        &self,
+    ) -> Result<SafetyPolicyConfig, Box<dyn std::error::Error>> {
+        let config = self.safety_policy_config();
+        config.resolve(None)?;
+        if self.step_interval_ms > config.max_acquisition_interval_ms
+            || self.step_interval_ms > config.max_sample_age_ms
+        {
+            return Err(
+                "step interval exceeds safety acquisition limit or sample-age limit".into(),
+            );
+        }
+        Ok(config)
+    }
+
     fn safety_policy_config(&self) -> SafetyPolicyConfig {
         SafetyPolicyConfig {
             temp_warn_c: self.safety_temp_warn_c,

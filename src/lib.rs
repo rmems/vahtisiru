@@ -54,6 +54,7 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 #![doc(test(attr(deny(unused))))]
 
+mod actuation_smoke;
 mod cpu;
 mod daemon;
 mod gpu;
