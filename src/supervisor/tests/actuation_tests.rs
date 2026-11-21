@@ -211,3 +211,99 @@ async fn panicking_actuator_worker_is_recorded_as_apply_failure() {
         (1, hw_is(false, 0, 0), true)
     );
 }
+
+// Fault 7: --force-software-only while a real brake is left over. Simulated
+// frames must hold the brake indefinitely and never authorize a release.
+#[tokio::test]
+async fn simulated_source_holds_leftover_brake_and_never_releases() {
+    let fake = Arc::new(FakeActuator::new());
+    fake.apply_emergency_brake(BRAKE_FRACTION).unwrap();
+    let mut sup = harness().actuator(fake.clone()).software_only().build();
+    sup.seed_startup_brake(Some(200), Some(400));
+    assert!(sup.snapshot().brake_engaged);
+
+    let held = Tick {
+        source: TelemetrySource::SoftwareFallback,
+        ..quiet(S::SimulatedSoftwareOnly, I::None, true)
+    };
+    for _ in 0..45 {
+        assert_eq!(tick(&sup.step().await), held);
+    }
+    let exported_brake = sup.relay_metrics.lock().unwrap().brake_engaged;
+    assert_eq!(
+        (hw(&fake), sup.warned_brake_held_sim, exported_brake),
+        (hw_is(true, 1, 0), true, true),
+        "brake held on hardware, operator warned, metrics report it"
+    );
+}
+
+/// A release held in flight (gate busy, so telemetry fail-closes): policy flags it
+/// superseded, and the instant it completes the restore is recorded
+/// honestly and Apply is dispatched in the *same* step (no cadence wait,
+/// no second release).
+#[tokio::test]
+async fn gate_busy_during_in_flight_release_reapplies_on_completion() {
+    let fake = Arc::new(FakeActuator::new());
+    fake.apply_emergency_brake(BRAKE_FRACTION).unwrap();
+    let ctl = Arc::new(ControlledActuator::new(Arc::clone(&fake)));
+    let (unblock, entered) = ctl.block_next_release();
+    let mut sup = harness()
+        .actuator(ctl)
+        .frames([fixtures::healthy_real()])
+        .build();
+    sup.seed_startup_brake(Some(200), Some(400));
+    sup.monotonic = Arc::new({
+        let ms = AtomicU64::new(0);
+        move || ms.fetch_add(1_000, Ordering::SeqCst)
+    });
+    let _ = step_until(&mut sup, 10, |r| r.dispatched).await;
+    entered.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(sup.release_task.is_some());
+
+    // The held release owns the NVML gate, so the next read is Busy and
+    // fail-closes (NvmlUnavailable → brake desired).
+    let report = sup.step().await;
+    assert_eq!(report.source, TelemetrySource::NvmlUnavailable);
+    assert!(sup.release_superseded.load(Ordering::Acquire));
+    assert_eq!(fake.release_calls(), 0, "release still held, not restored");
+
+    unblock.send(()).unwrap();
+    settle(&sup).await;
+    // Gate is free again and telemetry is still critical.
+    sup.acquirer = Arc::new(ScriptedAcquirer::new([critical_temp()]));
+    let report = sup.step().await;
+    assert_eq!(report.actuation, Some(ActuatorOutcome::Released));
+    assert_eq!(
+        (report.snapshot.intent, report.dispatched),
+        (I::Apply, true)
+    );
+    settle(&sup).await;
+    let report = step_until(&mut sup, 5, |r| r.actuation.is_some()).await;
+    assert_eq!(report.actuation, Some(ActuatorOutcome::Applied));
+    assert_eq!(hw(&fake), hw_is(true, 2, 1));
+}
+
+/// A release worker that skipped the driver (superseded before it started)
+/// is reconciled without recording an outcome: the flag clears, the brake
+/// stays engaged, and no restore was issued.
+#[tokio::test]
+async fn skipped_release_worker_records_nothing() {
+    let fake = Arc::new(FakeActuator::new());
+    fake.apply_emergency_brake(BRAKE_FRACTION).unwrap();
+    let mut sup = harness().actuator(fake.clone()).build();
+    sup.seed_startup_brake(Some(200), Some(400));
+    sup.release_superseded.store(true, Ordering::Release);
+    sup.release_task = Some(tokio::task::spawn_blocking(|| {
+        Err(ActuatorError::CommandFailed(RELEASE_SKIPPED.into()))
+    }));
+    settle(&sup).await;
+
+    let outcome = sup.reconcile_finished(ActuationKind::Release, true).await;
+    assert_eq!(outcome, None);
+    assert!(!sup.release_superseded.load(Ordering::Acquire));
+    assert!(sup.release_task.is_none());
+    assert_eq!(
+        (sup.snapshot().brake_engaged, hw(&fake)),
+        (true, hw_is(true, 1, 0))
+    );
+}

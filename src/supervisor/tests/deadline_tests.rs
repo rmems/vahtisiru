@@ -240,3 +240,71 @@ async fn settled_release_verifies_on_the_tick_read_without_a_second_acquire() {
         "healthy post-release telemetry must not re-brake"
     );
 }
+
+#[test]
+fn unavailable_tick_is_evaluated_without_waiting_for_tenth_tick() {
+    assert!(should_evaluate_tick(
+        false,
+        TelemetrySource::NvmlUnavailable
+    ));
+    assert!(!should_evaluate_tick(false, TelemetrySource::Nvml));
+    assert!(should_evaluate_tick(true, TelemetrySource::Nvml));
+}
+
+#[tokio::test]
+async fn busy_nvml_worker_fail_closes_tick_and_post_actuation_reads() {
+    let bridge = Arc::new(HardwareBridge::new(Some(GpuTarget::from_uuid_for_test(
+        "GPU-12345678-1234-1234-1234-123456789abc",
+    ))));
+    let mut sup = harness().acquirer(bridge).real_clock().build();
+    let _permit = sup.gate.try_enter().unwrap();
+    let raw = sup.acquire_raw_with_timeout().await;
+    assert_eq!(raw.source, TelemetrySource::NvmlUnavailable);
+    let frame = sup.assess(&raw);
+    assert_eq!(frame.gpu_temp_c.validity, SampleValidity::Missing);
+    sup.config.force_software_only = true;
+    assert_eq!(
+        sup.acquire_raw_with_timeout().await.source,
+        TelemetrySource::SoftwareFallback
+    );
+}
+
+// ---- RM-1476: wall-clock eval deadline + release preemption ----
+
+/// A tick far longer than the eval interval (slow acquire / large
+/// `--step-interval-ms`) still evaluates every step, so a Critical frame
+/// on step 2 trips on step 2 rather than on the 10th tick.
+#[tokio::test]
+async fn slow_ticks_evaluate_every_step_not_every_tenth() {
+    let fake = Arc::new(FakeActuator::new());
+    let mut sup = harness()
+        .actuator(fake.clone())
+        .frames([fixtures::healthy_real(), critical_temp()])
+        .build();
+    sup.monotonic = Arc::new({
+        let ms = AtomicU64::new(0);
+        move || ms.fetch_add(1_000, Ordering::SeqCst)
+    });
+    let first = sup.step().await;
+    assert_eq!(first.snapshot.intent, I::None);
+    let second = sup.step().await;
+    assert_eq!(
+        (second.step, second.snapshot.intent, second.dispatched),
+        (2, I::Apply, true)
+    );
+}
+
+/// Sub-deadline ticks must not evaluate; the deadline is wall-clock.
+#[tokio::test]
+async fn fast_ticks_wait_for_the_deadline() {
+    let mut sup = harness()
+        .frames([fixtures::healthy_real(), critical_temp()])
+        .build();
+    sup.monotonic = Arc::new({
+        let ms = AtomicU64::new(0);
+        move || ms.fetch_add(100, Ordering::SeqCst)
+    });
+    let _ = sup.step().await;
+    let second = sup.step().await; // 100 ms later: publish only
+    assert_eq!(second.snapshot.intent, I::None);
+}

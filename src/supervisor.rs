@@ -243,15 +243,8 @@ impl Supervisor {
         // step's read: the upcoming acquire already post-dates their
         // completion, so it doubles as the mandatory post-actuation
         // verification instead of spending the shared budget on a second
-        // read of the same state. At most one worker is ever in flight,
-        // so at most one slot settles.
-        let mut actuation = None;
-        let mut deferred_verify = false;
-        for kind in [ActuationKind::Apply, ActuationKind::Release] {
-            let outcome = self.reconcile_finished(kind, false).await;
-            deferred_verify |= outcome.as_ref().is_some_and(outcome_succeeded);
-            actuation = outcome.or(actuation);
-        }
+        // read of the same state.
+        let (mut actuation, deferred_verify) = self.reconcile_slots(false).await;
 
         let raw = self.acquire_raw_with_timeout().await;
         let telemetry = self.assess(&raw);
@@ -259,9 +252,7 @@ impl Supervisor {
         // A worker that finished during the acquire cannot trust the frame
         // above — it may predate completion — so it still pays for its own
         // re-read out of what budget remains.
-        for kind in [ActuationKind::Apply, ActuationKind::Release] {
-            actuation = self.reconcile_finished(kind, true).await.or(actuation);
-        }
+        actuation = self.reconcile_slots(true).await.0.or(actuation);
         let succeeded = actuation.as_ref().is_some_and(outcome_succeeded);
         let failed = actuation.is_some() && !succeeded;
 
@@ -313,6 +304,21 @@ impl Supervisor {
             dispatched,
             pending_intent: self.pending_intent,
         }
+    }
+
+    /// Join every finished actuation worker (at most one is ever in flight).
+    /// Returns the joined outcome and whether a success was recorded while
+    /// `reverify` was `false` — the caller then owes it a verification eval on
+    /// a frame that post-dates the completion.
+    async fn reconcile_slots(&mut self, reverify: bool) -> (Option<ActuatorOutcome>, bool) {
+        let mut actuation = None;
+        let mut needs_verify = false;
+        for kind in [ActuationKind::Apply, ActuationKind::Release] {
+            let outcome = self.reconcile_finished(kind, reverify).await;
+            needs_verify |= !reverify && outcome.as_ref().is_some_and(outcome_succeeded);
+            actuation = outcome.or(actuation);
+        }
+        (actuation, needs_verify)
     }
 
     /// Join the worker in `kind`'s slot if it has finished. On success the
