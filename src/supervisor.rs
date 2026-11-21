@@ -259,8 +259,8 @@ impl Supervisor {
         let now_ms = (self.monotonic)();
         // A worker joined before this read is verified by evaluating the
         // fresh frame now; a worker joined during the read already evaluated
-        // its own re-read, so the tick frame must not be evaluated a second
-        // time — it is published only via the normal cadence path below.
+        // its own re-read, which also drove this tick's publication — the tick
+        // frame is neither evaluated nor published a second time.
         let eval_due = deferred_verify
             || self
                 .last_eval_ms

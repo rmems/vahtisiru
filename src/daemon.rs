@@ -309,14 +309,22 @@ pub async fn run(prepared: &mut SupervisorStart) -> Result<(), Box<dyn std::erro
     // Seed the health verdict here, where a cold `nvidia-smi` start has the long
     // startup bound, so it cannot overrun the first tick and trip the brake.
     // No resolved target means no driver to probe: skip it so a wedged
-    // `nvidia-smi` cannot add its timeout to startup for nothing.
+    // `nvidia-smi` cannot add its timeout to startup for nothing. The probe is
+    // a subprocess, not an NVML call, so it does not take the gate — a wedged
+    // child holding the permit past this wait would starve every later read.
+    // Off the gate, the health watchdog abandons and retries it like any other
+    // probe that outlives its kill bound.
     if !cli.force_software_only && has_target {
         let probe_bridge = Arc::clone(&bridge);
-        if let Err(err) = nvml_gate
-            .run(NVML_TIMEOUT, move || probe_bridge.probe_health())
-            .await
+        match tokio::time::timeout(
+            NVML_TIMEOUT,
+            tokio::task::spawn_blocking(move || probe_bridge.probe_health()),
+        )
+        .await
         {
-            tracing::warn!(?err, "startup GPU health probe unavailable");
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => tracing::warn!(?err, "startup GPU health probe panicked"),
+            Err(_) => tracing::warn!("startup GPU health probe timed out; watchdog will retry"),
         }
     }
     let policy = config.resolve(if cli.force_software_only {

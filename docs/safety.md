@@ -128,15 +128,18 @@ of drifting a full extra interval late (an overrun is counted in
 
 Driver health is `timeout -k 1s 1s nvidia-smi -L`: SIGTERM at 1 s, SIGKILL at
 2 s. A failed or killed probe is `NvmlUnavailable`. The verdict is cached: the
-first probe runs at startup, then one re-probe every 30 s while healthy and every
-5 s after a failure, on a detached thread so it never consumes the acquisition
-budget. A wedged `nvidia-smi` can therefore go unnoticed for up to about 32 s
-while NVML keeps returning real readings, and the relay stays fail-closed for up
-to 5 s after the driver recovers. A hung NVML call does not depend on the probe:
-the acquisition deadline bounds it directly. A probe that outlives its own kill
-bound (a child stuck in uninterruptible sleep) is abandoned after 10 s: the
-cached verdict fails closed and a retry is allowed, so a stale "healthy" cannot
-be served forever and at most one unkillable straggler piles up per retry.
+first probe runs at startup when a GPU target resolved (off the NVML gate, so a
+wedged child cannot pin the gate), then one re-probe every 30 s while healthy and
+every 5 s after a failure, on a detached thread so it never consumes the
+acquisition budget. A wedged `nvidia-smi` can therefore go unnoticed for up to
+about 32 s while NVML keeps returning real readings, and the relay stays
+fail-closed for up to 5 s after the driver recovers. A hung NVML call does not
+depend on the probe: the acquisition deadline bounds it directly. A probe that
+outlives its own kill bound (a child stuck in uninterruptible sleep), including
+the startup probe, is abandoned after 10 s: the cached verdict fails closed and
+a retry is allowed, so a stale "healthy" cannot be served forever and at most
+one unkillable straggler piles up per retry. A late result from an abandoned
+probe is discarded, so it cannot overwrite the replacement's verdict.
 
 If policy wants the brake (`desired_brake`) while a **Release** is in flight,
 the release is flagged superseded: a worker that has not yet reached the driver
@@ -307,7 +310,7 @@ Exported without querying Brainstem:
 | `safety_actuator_failures_total` | counter | apply/release errors |
 | `safety_trips_total{reason}` | counter | deterministic trip events (one per fail-closed episode, see above); closed `SafetyReason` label set, all pre-registered at 0 |
 | `telemetry_freshness_s` | gauge | sample age at scrape time (monotonic receive instant) |
-| `telemetry_acquire_failures_total{reason}` | counter | real reads served as `NvmlUnavailable`; closed set `deadline_exceeded`, `gate_busy`, `worker_failed`, `driver_unavailable` (unhealthy probe verdict or NVML read failure inside a completed worker), all pre-registered at 0 |
+| `telemetry_acquire_failures_total{reason}` | counter | real reads served as `NvmlUnavailable`; closed set `deadline_exceeded`, `gate_busy`, `worker_failed`, `driver_unavailable` (no resolved GPU target, unhealthy probe verdict, or NVML read failure inside a completed worker), all pre-registered at 0 |
 | `supervisor_step_duration_seconds` | gauge | duration of the last supervisor step, excluding the sleep between steps |
 | `supervisor_loop_overruns_total` | counter | steps that took longer than `--step-interval-ms` |
 | `sensory_queue_depth` | gauge | frames currently buffered |

@@ -200,6 +200,9 @@ struct HealthState {
     healthy: Option<bool>,
     last_started: Option<Instant>,
     in_flight: bool,
+    /// Bumped on every probe launch. A result carrying an older generation is
+    /// from an abandoned probe and must not overwrite the replacement's state.
+    generation: u64,
 }
 
 /// What an acquisition does about the probe at this instant.
@@ -258,7 +261,7 @@ impl GpuHealth {
 
     /// Current verdict; schedules a probe if one is due. No verdict is unhealthy.
     fn check(self: &Arc<Self>, now: Instant) -> bool {
-        let (plan, cached) = {
+        let (plan, generation, cached) = {
             let mut state = self.state.lock().unwrap();
             // A probe that outlived its kill bound is wedged: fail closed and
             // free the slot so a retry can run, rather than serving the stale
@@ -272,52 +275,63 @@ impl GpuHealth {
                 state.healthy = Some(false);
             }
             let plan = plan_health_probe(&state, now);
+            let mut generation = state.generation;
             if plan != ProbePlan::UseCached {
                 state.in_flight = true;
                 state.last_started = Some(now);
+                state.generation += 1;
+                generation = state.generation;
             }
-            (plan, state.healthy.unwrap_or(false))
+            (plan, generation, state.healthy.unwrap_or(false))
         };
         match plan {
-            ProbePlan::Inline => self.run_and_record(),
+            ProbePlan::Inline => self.run_and_record(generation),
             ProbePlan::Background => {
-                self.spawn_probe();
+                self.spawn_probe(generation);
                 cached
             }
             ProbePlan::UseCached => cached,
         }
     }
 
-    fn spawn_probe(self: &Arc<Self>) {
+    fn spawn_probe(self: &Arc<Self>, generation: u64) {
         let health = Arc::clone(self);
         let spawned = std::thread::Builder::new()
             .name("gpu-health-probe".into())
             .spawn(move || {
-                health.run_and_record();
+                health.run_and_record(generation);
             });
         if spawned.is_err() {
-            self.record(false);
+            self.record(generation, false);
         }
     }
 
     fn probe_now(&self) -> bool {
-        {
+        let generation = {
             let mut state = self.state.lock().unwrap();
             state.in_flight = true;
             state.last_started = Some(Instant::now());
-        }
-        self.run_and_record()
+            state.generation += 1;
+            state.generation
+        };
+        self.run_and_record(generation)
     }
 
-    fn run_and_record(&self) -> bool {
+    fn run_and_record(&self, generation: u64) -> bool {
         let healthy = run_health_probe(&self.program);
-        self.record(healthy);
+        self.record(generation, healthy);
         healthy
     }
 
-    fn record(&self, healthy: bool) {
+    fn record(&self, generation: u64, healthy: bool) {
         let previous = {
             let mut state = self.state.lock().unwrap();
+            // A newer probe has already launched: this result is from an
+            // abandoned straggler, so it must not clobber the replacement's
+            // in-flight flag or verdict.
+            if generation != state.generation {
+                return;
+            }
             state.in_flight = false;
             state.healthy.replace(healthy)
         };
@@ -1129,7 +1143,26 @@ mod health_probe_tests {
             healthy,
             last_started: Some(now - age),
             in_flight: false,
+            generation: 0,
         }
+    }
+
+    #[test]
+    fn stale_probe_result_cannot_overwrite_the_replacement() {
+        let health = GpuHealth::new("nvidia-smi");
+        {
+            let mut state = health.state.lock().unwrap();
+            // A probe was abandoned and a replacement launched (generation 2).
+            state.healthy = Some(false);
+            state.in_flight = true;
+            state.generation = 2;
+        }
+        // The abandoned probe's late "healthy" arrives: it must not clear the
+        // replacement's in-flight flag nor flip the fail-closed verdict.
+        health.record(1, true);
+        let state = health.state.lock().unwrap();
+        assert!(state.in_flight);
+        assert_eq!(state.healthy, Some(false));
     }
 
     #[cfg(unix)]
@@ -1202,10 +1235,10 @@ mod health_probe_tests {
             state.last_started =
                 Some(Instant::now() - PROBE_ABANDON_AFTER - Duration::from_secs(1));
         }
-        // The stale verdict is not served: the call fails closed and frees
-        // the slot so a retry can find the driver again.
+        // The stale verdict is not served: the call fails closed and launches
+        // a replacement (generation bumped) so a retry can find the driver.
         assert!(!health.check(Instant::now()));
-        assert!(health.state.lock().unwrap().in_flight);
+        assert_eq!(health.state.lock().unwrap().generation, 1);
         // The replacement probe is a fast success: the verdict recovers.
         assert_eq!(wait_for_verdict(&health), Some(true));
     }
