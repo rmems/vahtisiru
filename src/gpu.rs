@@ -351,7 +351,7 @@ impl HardwareBridge {
 
     /// Bridge whose health probe runs `program` instead of `nvidia-smi`, so a
     /// fake binary can stand in without mutating the process `PATH`.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn with_health_program_for_test(
         target: Option<GpuTarget>,
         program: impl Into<OsString>,
@@ -1015,7 +1015,8 @@ mod tests {
 }
 
 /// Fake `nvidia-smi` executables for driving the real probe without a GPU.
-#[cfg(test)]
+/// Shell-script fakes and GNU `timeout` only exist on unix.
+#[cfg(all(test, unix))]
 pub(crate) mod fake_nvidia_smi {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -1091,11 +1092,14 @@ pub(crate) mod fake_nvidia_smi {
 
 #[cfg(test)]
 mod health_probe_tests {
+    #[cfg(unix)]
     use super::fake_nvidia_smi::{FakeBinary, IGNORES_SIGTERM};
     use super::*;
 
+    #[cfg(unix)]
     const UUID: &str = "GPU-12345678-1234-1234-1234-123456789abc";
 
+    #[cfg(unix)]
     fn bridge_running(fake: &FakeBinary) -> HardwareBridge {
         HardwareBridge::with_health_program_for_test(
             Some(GpuTarget::from_uuid_for_test(UUID)),
@@ -1111,6 +1115,7 @@ mod health_probe_tests {
         }
     }
 
+    #[cfg(unix)]
     fn wait_for_verdict(health: &GpuHealth) -> Option<bool> {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -1166,6 +1171,7 @@ mod health_probe_tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn sigterm_ignoring_binary_is_killed_and_reported_unhealthy() {
         let fake = FakeBinary::install(IGNORES_SIGTERM);
@@ -1179,6 +1185,7 @@ mod health_probe_tests {
         assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn healthy_path_does_not_exec_at_the_acquisition_cadence() {
         let fake = FakeBinary::install("exit 0\n");
@@ -1189,6 +1196,7 @@ mod health_probe_tests {
         assert_eq!(fake.calls(), 1);
     }
 
+    #[cfg(unix)]
     #[test]
     fn failed_probe_fails_closed_and_retries_are_rate_limited() {
         let fake = FakeBinary::install("exit 1\n");
@@ -1202,6 +1210,7 @@ mod health_probe_tests {
         assert_eq!(fake.calls(), 1);
     }
 
+    #[cfg(unix)]
     #[test]
     fn forced_software_and_absent_target_never_exec_the_probe() {
         let fake = FakeBinary::install("exit 0\n");
@@ -1220,12 +1229,14 @@ mod health_probe_tests {
         assert_eq!(fake.calls(), 0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn slow_obedient_probe_stays_healthy() {
         let fake = FakeBinary::install("sleep 0.5\n");
         assert!(run_health_probe(fake.path().as_os_str()));
     }
 
+    #[cfg(unix)]
     #[test]
     fn due_reprobe_answers_from_cache_without_waiting_for_a_hung_binary() {
         let fake = FakeBinary::install(IGNORES_SIGTERM);
@@ -1244,6 +1255,7 @@ mod health_probe_tests {
         assert!(!health.check(later));
     }
 
+    #[cfg(unix)]
     #[test]
     fn background_reprobe_restores_a_failed_verdict() {
         let fake = FakeBinary::install("exit 0\n");

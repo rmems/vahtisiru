@@ -1,4 +1,5 @@
 use super::*;
+#[cfg(unix)]
 use crate::gpu::fake_nvidia_smi::{FakeBinary, IGNORES_SIGTERM};
 use crate::gpu::{GpuTarget, NvmlActuator};
 use crate::publish::{AbsentPublisher, IsolatedPublishQueue, PublishError};
@@ -814,6 +815,7 @@ async fn hung_acquire_fail_closes_in_bounded_time_and_defers_brake_until_gate_fr
 // Fault 1b (RM-1475): the real probe against a SIGTERM-ignoring fake
 // `nvidia-smi`, at the production deadline. Evaluation runs inside 1 s, fails
 // closed, and SIGKILL frees the gate so the parked brake then lands.
+#[cfg(unix)]
 #[tokio::test]
 async fn sigterm_ignoring_nvidia_smi_cannot_stall_evaluation_past_one_second() {
     let fake_smi = FakeBinary::install(IGNORES_SIGTERM);

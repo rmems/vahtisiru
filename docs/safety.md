@@ -113,6 +113,11 @@ driver is evaluated fail-closed within **1 s** of the step start, and later tick
 find the gate busy and evaluate without waiting again. This bounds evaluation
 only; see the limits below for when the brake lands.
 
+The run loop paces steps from each step's start: it sleeps only the remainder
+of `--step-interval-ms`, so a slow step starts the next one immediately instead
+of drifting a full extra interval late (an overrun is counted in
+`supervisor_loop_overruns_total`, never slept off).
+
 Driver health is `timeout -k 1s 1s nvidia-smi -L`: SIGTERM at 1 s, SIGKILL at
 2 s. A failed or killed probe is `NvmlUnavailable`. The verdict is cached: the
 first probe runs at startup, then one re-probe every 30 s while healthy and every
