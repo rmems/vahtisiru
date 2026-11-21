@@ -293,6 +293,7 @@ pub async fn run(prepared: &mut SupervisorStart) -> Result<(), Box<dyn std::erro
     let target = resolve_gpu_target(&nvml_gate).await;
 
     let bridge = Arc::new(HardwareBridge::new(target.clone()));
+    let has_target = target.is_some();
     let actuator: Arc<dyn SafetyActuator> = Arc::new(NvmlActuator::new(target));
     // Read-only startup query also detects a persistent brake in software-only mode.
     let startup_actuator = Arc::clone(&actuator);
@@ -307,7 +308,9 @@ pub async fn run(prepared: &mut SupervisorStart) -> Result<(), Box<dyn std::erro
         });
     // Seed the health verdict here, where a cold `nvidia-smi` start has the long
     // startup bound, so it cannot overrun the first tick and trip the brake.
-    if !cli.force_software_only {
+    // No resolved target means no driver to probe: skip it so a wedged
+    // `nvidia-smi` cannot add its timeout to startup for nothing.
+    if !cli.force_software_only && has_target {
         let probe_bridge = Arc::clone(&bridge);
         if let Err(err) = nvml_gate
             .run(NVML_TIMEOUT, move || probe_bridge.probe_health())

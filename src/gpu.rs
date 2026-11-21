@@ -324,7 +324,7 @@ impl GpuHealth {
         // Log transitions only: the verdict is read on every telemetry tick.
         if !healthy && previous != Some(false) {
             println!(
-                "[hardware_bridge] nvidia-smi health probe failed or overran. Treating telemetry as unavailable (fail closed)."
+                "[hardware_bridge] nvidia-smi hung or health probe failed. Treating telemetry as unavailable (fail closed)."
             );
         } else if healthy && previous == Some(false) {
             println!("[hardware_bridge] nvidia-smi health probe recovered.");

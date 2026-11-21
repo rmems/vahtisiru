@@ -353,7 +353,7 @@ The daemon exports metrics compatible with Prometheus. Safety state is
 observable here; there is no neural-state query:
 
 - `telemetry_freshness_s` — sample age at scrape time (monotonic receive instant, not source wall time)
-- `telemetry_acquire_failures_total{reason}` — real reads served as `NvmlUnavailable` (`deadline_exceeded`, `gate_busy`, `worker_failed`)
+- `telemetry_acquire_failures_total{reason}` — real reads served as `NvmlUnavailable` (`deadline_exceeded`, `gate_busy`, `worker_failed`, `driver_unavailable`)
 - `supervisor_step_duration_seconds` / `supervisor_loop_overruns_total` — last step duration, and steps longer than `--step-interval-ms`
 - `safety_state{state=...}` / `safety_state_id` — current named safety state
 - `safety_policy_state{state=...}` — policy classification before the ActuatorFailure overlay (`safety_state` is the overlay)

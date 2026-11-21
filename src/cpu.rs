@@ -103,7 +103,11 @@ pub(crate) fn register_supervisor_loop_series() {
     for err in NvmlRunError::ALL {
         counter!("telemetry_acquire_failures_total", "reason" => err.as_str()).increment(0);
     }
+    // Driver-side `NvmlUnavailable` serves are acquire failures too, just not
+    // gate errors: a wedged/absent driver reads as zero until it is counted.
+    counter!("telemetry_acquire_failures_total", "reason" => "driver_unavailable").increment(0);
     counter!("supervisor_loop_overruns_total").increment(0);
+    gauge!("supervisor_step_duration_seconds").set(0.0);
 }
 
 /// Count a real telemetry read that was served as `NvmlUnavailable` instead.
@@ -112,6 +116,13 @@ pub(crate) fn record_acquire_failure(metrics: &mut RelayMetrics, err: NvmlRunErr
         metrics.acquire_deadline_exceeded_total += 1;
     }
     counter!("telemetry_acquire_failures_total", "reason" => err.as_str()).increment(1);
+}
+
+/// Count a read that returned `NvmlUnavailable` without a gate-level error —
+/// an unhealthy cached probe verdict or an NVML read failure inside the
+/// worker. Gate errors are counted separately via [`record_acquire_failure`].
+pub(crate) fn record_driver_unavailable() {
+    counter!("telemetry_acquire_failures_total", "reason" => "driver_unavailable").increment(1);
 }
 
 /// Export a finished step's duration; one longer than `period` is an overrun.

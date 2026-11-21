@@ -420,7 +420,15 @@ impl Supervisor {
             tracing::warn!(error = ?result.as_ref().err(), "NVML acquisition unavailable; treating as unavailable");
         }
         match result {
-            Ok(raw) => raw,
+            Ok(raw) => {
+                // A successful worker can still report the driver unavailable
+                // (unhealthy probe verdict or NVML read failure): count it so
+                // the failure counter is not blind to driver-side serves.
+                if raw.source == TelemetrySource::NvmlUnavailable {
+                    cpu::record_driver_unavailable();
+                }
+                raw
+            }
             Err(err) => {
                 cpu::record_acquire_failure(&mut self.relay_metrics.lock().unwrap(), err);
                 RawTelemetry::nvml_unavailable((self.clock)())

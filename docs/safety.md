@@ -307,7 +307,7 @@ Exported without querying Brainstem:
 | `safety_actuator_failures_total` | counter | apply/release errors |
 | `safety_trips_total{reason}` | counter | deterministic trip events (one per fail-closed episode, see above); closed `SafetyReason` label set, all pre-registered at 0 |
 | `telemetry_freshness_s` | gauge | sample age at scrape time (monotonic receive instant) |
-| `telemetry_acquire_failures_total{reason}` | counter | real reads served as `NvmlUnavailable`; closed set `deadline_exceeded`, `gate_busy`, `worker_failed`, all pre-registered at 0 |
+| `telemetry_acquire_failures_total{reason}` | counter | real reads served as `NvmlUnavailable`; closed set `deadline_exceeded`, `gate_busy`, `worker_failed`, `driver_unavailable` (unhealthy probe verdict or NVML read failure inside a completed worker), all pre-registered at 0 |
 | `supervisor_step_duration_seconds` | gauge | duration of the last supervisor step, excluding the sleep between steps |
 | `supervisor_loop_overruns_total` | counter | steps that took longer than `--step-interval-ms` |
 | `sensory_queue_depth` | gauge | frames currently buffered |
