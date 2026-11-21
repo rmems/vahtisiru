@@ -28,7 +28,8 @@ use crate::safety::{
 };
 use crate::shutdown::ShutdownReason;
 use crate::supervisor::{
-    NVML_TIMEOUT, Supervisor, SupervisorConfig, SupervisorParts, monotonic_ms_clock,
+    ACQUIRE_DEADLINE, NVML_TIMEOUT, Supervisor, SupervisorConfig, SupervisorParts,
+    monotonic_ms_clock,
 };
 use crate::telemetry::{
     SAFETY_EVAL_CADENCE_MS, SampleClock, SampleValidity, TelemetrySample, TelemetrySource,
@@ -202,7 +203,7 @@ fn supervisor_config(cli: &Cli) -> SupervisorConfig {
         force_software_only: cli.force_software_only,
         cadence_ms: cli.step_interval_ms,
         eval_interval_ms: SAFETY_EVAL_CADENCE_MS,
-        nvml_timeout: NVML_TIMEOUT,
+        acquire_deadline: ACQUIRE_DEADLINE,
         dashboard: true,
     }
 }
@@ -234,6 +235,17 @@ pub async fn run(prepared: &mut SupervisorStart) -> Result<(), Box<dyn std::erro
             tracing::warn!(?err, "startup NVML power-limit query unavailable");
             (None, None)
         });
+    // Seed the health verdict here, where a cold `nvidia-smi` start has the long
+    // startup bound, so it cannot overrun the first tick and trip the brake.
+    if !cli.force_software_only {
+        let probe_bridge = Arc::clone(&bridge);
+        if let Err(err) = nvml_gate
+            .run(NVML_TIMEOUT, move || probe_bridge.probe_health())
+            .await
+        {
+            tracing::warn!(?err, "startup GPU health probe unavailable");
+        }
+    }
     let policy = config.resolve(if cli.force_software_only {
         None
     } else {
@@ -997,7 +1009,7 @@ mod tests {
                 force_software_only: true,
                 cadence_ms: 100,
                 eval_interval_ms: SAFETY_EVAL_CADENCE_MS,
-                nvml_timeout: NVML_TIMEOUT,
+                acquire_deadline: ACQUIRE_DEADLINE,
                 dashboard: false,
             },
             SupervisorParts {

@@ -106,6 +106,22 @@ frame is evaluated on every tick, and every successful actuator task triggers a
 fresh-frame reassessment. Failed apply/release is recorded and retried on the
 deadline rather than every tick.
 
+Telemetry acquisition cannot hold evaluation back. All telemetry waits in one
+step share a 900 ms wall-clock budget (`ACQUIRE_DEADLINE`), including a
+post-actuation re-read. A wait that overruns is `NvmlUnavailable`, so a wedged
+driver is evaluated fail-closed within **1 s** of the step start, and later ticks
+find the gate busy and evaluate without waiting again. This bounds evaluation
+only; see the limits below for when the brake lands.
+
+Driver health is `timeout -k 1s 1s nvidia-smi -L`: SIGTERM at 1 s, SIGKILL at
+2 s. A failed or killed probe is `NvmlUnavailable`. The verdict is cached: the
+first probe runs at startup, then one re-probe every 30 s while healthy and every
+5 s after a failure, on a detached thread so it never consumes the acquisition
+budget. A wedged `nvidia-smi` can therefore go unnoticed for up to about 32 s
+while NVML keeps returning real readings, and the relay stays fail-closed for up
+to 5 s after the driver recovers. A hung NVML call does not depend on the probe:
+the acquisition deadline bounds it directly.
+
 If policy wants the brake (`desired_brake`) while a **Release** is in flight,
 the release is flagged superseded: a worker that has not yet reached the driver
 skips it. A call already inside `nvidia-smi -pl` cannot be interrupted, so it
@@ -275,6 +291,9 @@ Exported without querying Brainstem:
 | `safety_actuator_failures_total` | counter | apply/release errors |
 | `safety_trips_total{reason}` | counter | deterministic trip events (one per fail-closed episode, see above); closed `SafetyReason` label set, all pre-registered at 0 |
 | `telemetry_freshness_s` | gauge | sample age at scrape time (monotonic receive instant) |
+| `telemetry_acquire_failures_total{reason}` | counter | real reads served as `NvmlUnavailable`; closed set `deadline_exceeded`, `gate_busy`, `worker_failed`, all pre-registered at 0 |
+| `supervisor_step_duration_seconds` | gauge | duration of the last supervisor step, excluding the sleep between steps |
+| `supervisor_loop_overruns_total` | counter | steps that took longer than `--step-interval-ms` |
 | `sensory_queue_depth` | gauge | frames currently buffered |
 | `sensory_queue_capacity` | gauge | configured finite capacity |
 | `sensory_queue_enqueued_total` | counter | frames accepted into the queue |

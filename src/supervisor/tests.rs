@@ -1,4 +1,5 @@
 use super::*;
+use crate::gpu::fake_nvidia_smi::{FakeBinary, IGNORES_SIGTERM};
 use crate::gpu::{GpuTarget, NvmlActuator};
 use crate::publish::{AbsentPublisher, IsolatedPublishQueue, PublishError};
 use crate::safety::{FakeActuator, SafetyReason};
@@ -544,7 +545,7 @@ impl Harness {
                 force_software_only: self.software_only,
                 cadence_ms: 100,
                 eval_interval_ms: 1_000,
-                nvml_timeout: FAST_TIMEOUT,
+                acquire_deadline: FAST_TIMEOUT,
                 dashboard: false,
             },
             SupervisorParts {
@@ -807,6 +808,102 @@ async fn hung_acquire_fail_closes_in_bounded_time_and_defers_brake_until_gate_fr
             joined(Outcome::Applied, S::Recovering, I::None, true),
             hw_is(true, 1, 0)
         )
+    );
+}
+
+// Fault 1b (RM-1475): the real probe against a SIGTERM-ignoring fake
+// `nvidia-smi`, at the production deadline. Evaluation runs inside 1 s, fails
+// closed, and SIGKILL frees the gate so the parked brake then lands.
+#[tokio::test]
+async fn sigterm_ignoring_nvidia_smi_cannot_stall_evaluation_past_one_second() {
+    let fake_smi = FakeBinary::install(IGNORES_SIGTERM);
+    let bridge = Arc::new(HardwareBridge::with_health_program_for_test(
+        Some(GpuTarget::from_uuid_for_test(
+            "GPU-12345678-1234-1234-1234-123456789abc",
+        )),
+        fake_smi.path(),
+    ));
+    let fake = Arc::new(FakeActuator::new());
+    let mut sup = harness().actuator(fake.clone()).acquirer(bridge).build();
+    sup.config.acquire_deadline = ACQUIRE_DEADLINE;
+    let parked = Tick {
+        pending: Some(I::Apply),
+        ..unavailable(S::TelemetryMissing, I::Apply, false)
+    };
+
+    let started = Instant::now();
+    let report = sup.step().await;
+    let elapsed = started.elapsed();
+    assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+    assert_eq!(tick(&report), parked);
+    let exceeded = sup
+        .relay_metrics
+        .lock()
+        .unwrap()
+        .acquire_deadline_exceeded_total;
+    assert_eq!(exceeded, 1);
+
+    // The probe is still dying: later ticks do not wait out another deadline.
+    let started = Instant::now();
+    assert_eq!(tick(&sup.step().await), parked);
+    assert!(started.elapsed() < Duration::from_millis(500));
+
+    wait_gate_free(&sup).await;
+    let report = sup.step().await;
+    assert_eq!(report.source, TelemetrySource::NvmlUnavailable);
+    assert!(report.dispatched, "brake takes the freed gate first");
+    settle(&sup).await;
+    assert_eq!(hw(&fake), hw_is(true, 1, 0));
+}
+
+// A post-actuation re-read shares the step's budget: once it is spent no worker
+// starts and the read fails closed at once.
+#[tokio::test]
+async fn spent_tick_budget_fails_closed_without_starting_a_worker() {
+    let acquirer = Arc::new(ScriptedAcquirer::new([fixtures::healthy_real()]));
+    let mut sup = harness().acquirer(acquirer.clone()).build();
+    sup.tick_deadline = Some(Instant::now());
+
+    let raw = sup.acquire_raw_with_timeout().await;
+
+    assert_eq!(raw.source, TelemetrySource::NvmlUnavailable);
+    assert_eq!(acquirer.calls(), 0);
+    let exceeded = sup
+        .relay_metrics
+        .lock()
+        .unwrap()
+        .acquire_deadline_exceeded_total;
+    assert_eq!(exceeded, 1);
+}
+
+#[tokio::test]
+async fn step_longer_than_its_period_counts_one_overrun() {
+    let acquirer = Arc::new(ScriptedAcquirer::new([fixtures::healthy_real()]));
+    let (release, _entered) = acquirer.hang_until_released();
+    let mut sup = harness().acquirer(acquirer.clone()).build();
+    sup.config.cadence_ms = 1;
+
+    sup.step().await;
+    let overruns = sup.relay_metrics.lock().unwrap().loop_overruns_total;
+    assert_eq!(overruns, 1);
+
+    acquirer.unhang();
+    release.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn software_only_steps_record_no_acquire_failures_or_overruns() {
+    let mut sup = harness().software_only().build();
+    for _ in 0..20 {
+        sup.step().await;
+    }
+    let metrics = sup.relay_metrics.lock().unwrap().clone();
+    assert_eq!(
+        (
+            metrics.acquire_deadline_exceeded_total,
+            metrics.loop_overruns_total
+        ),
+        (0, 0)
     );
 }
 

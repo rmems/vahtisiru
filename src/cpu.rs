@@ -12,6 +12,7 @@ use tokio::time::sleep;
 use tracing::{Level, info};
 use tracing_subscriber::FmtSubscriber;
 
+use crate::nvml_gate::NvmlRunError;
 use crate::publish::register_sensory_queue_metrics_without_queue;
 use crate::safety::{SafetyReason, SafetySnapshot, SafetyState};
 use crate::shutdown::ShutdownPlan;
@@ -38,6 +39,10 @@ pub struct RelayMetrics {
     pub shutdown_reason: Option<&'static str>,
     pub shutdown_unresolved_brake: bool,
     pub shutdown_unresolved_actuator: bool,
+    /// Telemetry waits abandoned at the acquisition deadline.
+    pub acquire_deadline_exceeded_total: u64,
+    /// Steps that took longer than the configured step interval.
+    pub loop_overruns_total: u64,
 }
 
 impl Default for RelayMetrics {
@@ -52,6 +57,8 @@ impl Default for RelayMetrics {
             shutdown_reason: None,
             shutdown_unresolved_brake: false,
             shutdown_unresolved_actuator: false,
+            acquire_deadline_exceeded_total: 0,
+            loop_overruns_total: 0,
         }
     }
 }
@@ -87,6 +94,36 @@ pub fn record_safety_snapshot(metrics: &mut RelayMetrics, snap: &SafetySnapshot)
 pub fn register_safety_trip_series() {
     for code in SafetyReason::ALL {
         counter!("safety_trips_total", "reason" => code.as_str()).increment(0);
+    }
+}
+
+/// Pre-register acquisition-failure and loop-overrun series at zero so a scrape
+/// can distinguish "never happened" from "metric missing".
+pub(crate) fn register_supervisor_loop_series() {
+    for err in NvmlRunError::ALL {
+        counter!("telemetry_acquire_failures_total", "reason" => err.as_str()).increment(0);
+    }
+    counter!("supervisor_loop_overruns_total").increment(0);
+}
+
+/// Count a real telemetry read that was served as `NvmlUnavailable` instead.
+pub(crate) fn record_acquire_failure(metrics: &mut RelayMetrics, err: NvmlRunError) {
+    if err == NvmlRunError::TimedOut {
+        metrics.acquire_deadline_exceeded_total += 1;
+    }
+    counter!("telemetry_acquire_failures_total", "reason" => err.as_str()).increment(1);
+}
+
+/// Export a finished step's duration; one longer than `period` is an overrun.
+pub(crate) fn record_step_duration(
+    metrics: &mut RelayMetrics,
+    elapsed: Duration,
+    period: Duration,
+) {
+    gauge!("supervisor_step_duration_seconds").set(elapsed.as_secs_f64());
+    if elapsed > period {
+        metrics.loop_overruns_total += 1;
+        counter!("supervisor_loop_overruns_total").increment(1);
     }
 }
 
@@ -143,6 +180,7 @@ pub fn init_telemetry(metrics_addr: std::net::SocketAddr) {
 
     register_sensory_queue_metrics_without_queue();
     register_safety_trip_series();
+    register_supervisor_loop_series();
 
     info!(
         "Telemetry initialized. Prometheus metrics available on http://{}/metrics",
@@ -294,6 +332,39 @@ mod tests {
         assert_eq!(
             text.matches("safety_trips_total{").count(),
             SafetyReason::ALL.len()
+        );
+    }
+
+    #[test]
+    fn acquire_failure_and_overrun_series_are_exported() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let mut relay = RelayMetrics::default();
+        metrics::with_local_recorder(&recorder, || {
+            register_supervisor_loop_series();
+            record_acquire_failure(&mut relay, NvmlRunError::TimedOut);
+            record_acquire_failure(&mut relay, NvmlRunError::Busy);
+            record_acquire_failure(&mut relay, NvmlRunError::Busy);
+            let period = Duration::from_millis(100);
+            record_step_duration(&mut relay, period, period);
+            record_step_duration(&mut relay, Duration::from_millis(900), period);
+        });
+        let text = handle.render();
+        let expected = [
+            "telemetry_acquire_failures_total{reason=\"deadline_exceeded\"} 1",
+            "telemetry_acquire_failures_total{reason=\"gate_busy\"} 2",
+            "telemetry_acquire_failures_total{reason=\"worker_failed\"} 0",
+            "supervisor_loop_overruns_total 1",
+            "supervisor_step_duration_seconds 0.9",
+        ];
+        let missing: Vec<_> = expected.iter().filter(|l| !text.contains(*l)).collect();
+        assert!(missing.is_empty(), "missing {missing:?} in:\n{text}");
+        assert_eq!(
+            (
+                relay.acquire_deadline_exceeded_total,
+                relay.loop_overruns_total
+            ),
+            (1, 1)
         );
     }
 

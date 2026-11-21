@@ -12,7 +12,7 @@
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 
 use crate::cpu::{self, RelayMetrics};
@@ -33,8 +33,12 @@ use crate::telemetry::{
     UnixMillis, assess_with_clock,
 };
 
-/// Bound on any single NVML wait (telemetry read, startup query, actuation).
+/// Bound on a startup or smoke-test NVML wait, before the safety loop runs.
 pub(crate) const NVML_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Wall-clock budget for all telemetry waits in one step. Overrun is
+/// `NvmlUnavailable`, so fail-closed evaluation runs within 1 s of the step start.
+pub(crate) const ACQUIRE_DEADLINE: Duration = Duration::from_millis(900);
 
 /// Blocking raw-telemetry source. Production is [`HardwareBridge`] (NVML);
 /// tests inject scripted frames or a worker that hangs.
@@ -73,8 +77,8 @@ pub(crate) struct SupervisorConfig {
     pub cadence_ms: u64,
     /// Wall-clock safety-evaluation period (ms), independent of tick length.
     pub eval_interval_ms: u64,
-    /// Bound on each gated NVML wait.
-    pub nvml_timeout: Duration,
+    /// Budget shared by every gated telemetry wait in one step.
+    pub acquire_deadline: Duration,
     /// Print the live dashboard line to stdout each step.
     pub dashboard: bool,
 }
@@ -134,6 +138,8 @@ pub(crate) struct Supervisor {
     pending_intent: Option<BrakeIntent>,
     step_count: u64,
     last_eval_ms: Option<u64>,
+    /// When this step's acquisition budget runs out.
+    tick_deadline: Option<Instant>,
     /// Set when policy wants the brake (`desired_brake`) while a Release is in
     /// flight: a release not yet at the driver is skipped without being recorded.
     release_superseded: Arc<AtomicBool>,
@@ -159,6 +165,7 @@ impl Supervisor {
             pending_intent: None,
             step_count: 0,
             last_eval_ms: None,
+            tick_deadline: None,
             release_superseded: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -219,6 +226,8 @@ impl Supervisor {
     /// gate-bounded telemetry read and joining a worker that has already
     /// finished. Sleeping between ticks is the caller's job.
     pub(crate) async fn step(&mut self) -> StepReport {
+        let started = Instant::now();
+        self.tick_deadline = Some(started + self.config.acquire_deadline);
         self.step_count += 1;
         let step_count = self.step_count;
         let mut dispatched = false;
@@ -257,6 +266,11 @@ impl Supervisor {
         {
             let mut metrics = self.relay_metrics.lock().unwrap();
             metrics.telemetry_acquired_at = Some(telemetry.acquired_at);
+            cpu::record_step_duration(
+                &mut metrics,
+                started.elapsed(),
+                Duration::from_millis(self.config.cadence_ms),
+            );
         }
 
         let snapshot = self.machine.snapshot();
@@ -349,24 +363,35 @@ impl Supervisor {
         )
     }
 
-    /// Bounded single-flight acquisition for both per-tick and post-actuation reads.
+    /// Bounded single-flight acquisition for both per-tick and post-actuation
+    /// reads. Both draw on one per-step budget, so a post-actuation read cannot
+    /// stretch the step past the deadline; a spent budget starts no worker.
     async fn acquire_raw_with_timeout(&mut self) -> RawTelemetry {
         if self.config.force_software_only {
             return self.acquirer.acquire_raw(true);
         }
-        let acquirer = Arc::clone(&self.acquirer);
-        let result = self
-            .gate
-            .run(self.config.nvml_timeout, move || {
-                acquirer.acquire_raw(false)
-            })
-            .await;
+        let budget = self
+            .tick_deadline
+            .map_or(self.config.acquire_deadline, |end| {
+                end.saturating_duration_since(Instant::now())
+            });
+        let result = if budget.is_zero() {
+            Err(NvmlRunError::TimedOut)
+        } else {
+            let acquirer = Arc::clone(&self.acquirer);
+            self.gate
+                .run(budget, move || acquirer.acquire_raw(false))
+                .await
+        };
         if should_log_acquisition_error(&mut self.warned_nvml_busy, result.as_ref().err()) {
             tracing::warn!(error = ?result.as_ref().err(), "NVML acquisition unavailable; treating as unavailable");
         }
         match result {
             Ok(raw) => raw,
-            Err(_) => RawTelemetry::nvml_unavailable((self.clock)()),
+            Err(err) => {
+                cpu::record_acquire_failure(&mut self.relay_metrics.lock().unwrap(), err);
+                RawTelemetry::nvml_unavailable((self.clock)())
+            }
         }
     }
 

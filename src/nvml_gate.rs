@@ -8,11 +8,24 @@ use std::time::Duration;
 #[derive(Clone, Default)]
 pub(crate) struct NvmlGate(Arc<AtomicBool>);
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NvmlRunError {
     Busy,
     TimedOut,
     WorkerFailed,
+}
+
+impl NvmlRunError {
+    pub(crate) const ALL: [Self; 3] = [Self::Busy, Self::TimedOut, Self::WorkerFailed];
+
+    /// Stable metric label.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Busy => "gate_busy",
+            Self::TimedOut => "deadline_exceeded",
+            Self::WorkerFailed => "worker_failed",
+        }
+    }
 }
 
 pub(crate) struct Permit(Arc<AtomicBool>);
