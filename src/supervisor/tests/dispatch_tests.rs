@@ -3,47 +3,26 @@
 use super::*;
 
 #[test]
-fn unchanged_brake_intent_retries_only_on_safety_cadence() {
-    assert!(should_dispatch_intent(
-        false,
-        BrakeIntent::None,
-        BrakeIntent::Apply,
-        false,
-    ));
-    assert!(!should_dispatch_intent(
-        false,
-        BrakeIntent::Apply,
-        BrakeIntent::Apply,
-        false,
-    ));
-    assert!(should_dispatch_intent(
-        true,
-        BrakeIntent::Apply,
-        BrakeIntent::Apply,
-        false,
-    ));
-}
-
-#[test]
-fn failed_actuation_does_not_retry_again_on_its_completion_tick() {
-    assert!(!should_dispatch_intent(
-        true,
-        BrakeIntent::Apply,
-        BrakeIntent::Apply,
-        true,
-    ));
-    assert!(should_dispatch_intent(
-        true,
-        BrakeIntent::Apply,
-        BrakeIntent::Apply,
-        false,
-    ));
-    assert!(should_dispatch_intent(
-        true,
-        BrakeIntent::Release,
-        BrakeIntent::Apply,
-        true,
-    ));
+fn should_dispatch_intent_truth_table() {
+    // (cadence_due, prior, current, actuation_failed) -> dispatch now?
+    let cases: &[(bool, BrakeIntent, BrakeIntent, bool, bool)] = &[
+        // An intent edge always dispatches, even on a non-due tick.
+        (false, BrakeIntent::None, BrakeIntent::Apply, false, true),
+        // An unchanged intent off cadence does not.
+        (false, BrakeIntent::Apply, BrakeIntent::Apply, false, false),
+        // An unchanged intent on cadence retries ...
+        (true, BrakeIntent::Apply, BrakeIntent::Apply, false, true),
+        // ... but not on the tick that just recorded its failure ...
+        (true, BrakeIntent::Apply, BrakeIntent::Apply, true, false),
+        // ... while an edge still dispatches on that failure tick.
+        (true, BrakeIntent::Release, BrakeIntent::Apply, true, true),
+    ];
+    for &(due, prior, current, failed, expected) in cases {
+        assert_eq!(
+            should_dispatch_intent(due, prior, current, failed),
+            expected
+        );
+    }
 }
 
 #[test]
