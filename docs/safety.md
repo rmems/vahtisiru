@@ -107,11 +107,19 @@ fresh-frame reassessment. Failed apply/release is recorded and retried on the
 deadline rather than every tick.
 
 Telemetry acquisition cannot hold evaluation back. All telemetry waits in one
-step share a 900 ms wall-clock budget (`ACQUIRE_DEADLINE`), including a
-post-actuation re-read. A wait that overruns is `NvmlUnavailable`, so a wedged
-driver is evaluated fail-closed within **1 s** of the step start, and later ticks
-find the gate busy and evaluate without waiting again. This bounds evaluation
-only; see the limits below for when the brake lands.
+step share a 900 ms wall-clock budget (`ACQUIRE_DEADLINE`). A wait that
+overruns is `NvmlUnavailable`, so a wedged driver is evaluated fail-closed
+within **1 s** of the step start, and later ticks find the gate busy and
+evaluate without waiting again. The budget bounds the *driver waits* only —
+deterministic in-process work (joining finished workers, logging, the
+evaluation itself) is not wall-clock bounded. See the limits below for when
+the brake lands.
+
+A successful actuation that settled during the inter-tick sleep is verified
+by that step's regular read — the read already post-dates the completion, so
+it doubles as the mandatory post-actuation verification rather than paying
+for a second read out of the same budget. Only a worker that finished
+mid-read takes a second, still budget-bounded, re-read.
 
 The run loop paces steps from each step's start: it sleeps only the remainder
 of `--step-interval-ms`, so a slow step starts the next one immediately instead
@@ -125,7 +133,10 @@ first probe runs at startup, then one re-probe every 30 s while healthy and ever
 budget. A wedged `nvidia-smi` can therefore go unnoticed for up to about 32 s
 while NVML keeps returning real readings, and the relay stays fail-closed for up
 to 5 s after the driver recovers. A hung NVML call does not depend on the probe:
-the acquisition deadline bounds it directly.
+the acquisition deadline bounds it directly. A probe that outlives its own kill
+bound (a child stuck in uninterruptible sleep) is abandoned after 10 s: the
+cached verdict fails closed and a retry is allowed, so a stale "healthy" cannot
+be served forever and at most one unkillable straggler piles up per retry.
 
 If policy wants the brake (`desired_brake`) while a **Release** is in flight,
 the release is flagged superseded: a worker that has not yet reached the driver

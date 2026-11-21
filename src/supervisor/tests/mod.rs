@@ -10,6 +10,9 @@ use std::sync::atomic::AtomicU64;
 use std::sync::mpsc;
 use std::time::Instant;
 
+mod actuation_tests;
+mod deadline_tests;
+
 // ---- unit tests for the pure helpers (moved from daemon.rs) ----
 
 #[test]
@@ -338,6 +341,8 @@ struct ScriptedAcquirer {
     hang_armed: AtomicBool,
     calls: Mutex<u32>,
     hang_entered: Mutex<Option<mpsc::Sender<()>>>,
+    /// Per-call sleep simulating a slow-but-obedient driver.
+    delay: Duration,
 }
 
 impl ScriptedAcquirer {
@@ -351,7 +356,14 @@ impl ScriptedAcquirer {
             hang_armed: AtomicBool::new(false),
             calls: Mutex::new(0),
             hang_entered: Mutex::new(None),
+            delay: Duration::ZERO,
         }
+    }
+
+    /// Every real read blocks the worker for `delay` before answering.
+    fn with_delay(mut self, delay: Duration) -> Self {
+        self.delay = delay;
+        self
     }
 
     /// Make every subsequent gated read block until `release` fires.
@@ -382,6 +394,9 @@ impl TelemetryAcquirer for ScriptedAcquirer {
         *self.calls.lock().unwrap() += 1;
         if force_software_only {
             return fixtures::software_fallback();
+        }
+        if !self.delay.is_zero() {
+            std::thread::sleep(self.delay);
         }
         // Block *without* holding our own mutex across the wait so the
         // test can call `unhang()` / `calls()` while a worker is parked.
@@ -743,382 +758,6 @@ fn joined(outcome: Outcome, state: SafetyState, intent: BrakeIntent, brake_engag
     }
 }
 
-// Fault 1: hung NVML acquire. The tick must return within the bound, fail
-// closed, and must not invent an actuator failure; the brake is parked
-// because the wedged worker still holds the gate, then applied once the
-// driver call returns.
-#[tokio::test]
-async fn hung_acquire_fail_closes_in_bounded_time_and_defers_brake_until_gate_frees() {
-    let fake = Arc::new(FakeActuator::new());
-    // Hold the eventual apply in flight so its dispatch tick is
-    // deterministic; the bare fake can race that tick's own read.
-    let controlled = Arc::new(ControlledActuator::new(fake.clone()));
-    let (release_apply, apply_entered) = controlled.block_next_apply();
-    let acquirer = Arc::new(ScriptedAcquirer::new([fixtures::healthy_real()]));
-    let (release, entered) = acquirer.hang_until_released();
-    let mut sup = harness()
-        .actuator(controlled)
-        .acquirer(acquirer.clone())
-        .build();
-    let parked = Tick {
-        pending: Some(I::Apply),
-        ..unavailable(S::TelemetryMissing, I::Apply, false)
-    };
-
-    let started = Instant::now();
-    let report = sup.step().await;
-    let bounded = started.elapsed() < Duration::from_secs(1);
-    entered.recv_timeout(Duration::from_secs(1)).unwrap();
-    assert_eq!((bounded, tick(&report)), (true, parked));
-    // No actuation attempt and no invented actuator failure.
-    assert_eq!(
-        (hw(&fake), sup.machine().actuator_failures_total()),
-        (hw_is(false, 0, 0), 0)
-    );
-
-    // Still hung: every tick stays fail-closed and parks the intent; the
-    // gate is single-flight so no second worker piles up behind the first.
-    for _ in 0..3 {
-        assert_eq!(tick(&sup.step().await), parked);
-    }
-    assert_eq!(acquirer.calls(), 1, "no second read worker");
-
-    // Driver returns: the parked brake takes the freed gate before this
-    // tick's own read, which then finds the gate held by the apply and
-    // fails closed rather than spawning anything else.
-    acquirer.unhang();
-    release.send(()).unwrap();
-    wait_gate_free(&sup).await;
-    let report = sup.step().await;
-    apply_entered.recv_timeout(Duration::from_secs(1)).unwrap();
-    let claimed = Tick {
-        in_flight: InFlightActuation::Apply,
-        dispatched: true,
-        ..unavailable(S::TelemetryMissing, I::Apply, false)
-    };
-    assert_eq!(tick(&report), claimed, "brake claims gate first");
-
-    // The post-apply re-read reached the recovered driver (healthy frame),
-    // so the machine is Recovering rather than still fail-closed.
-    release_apply.send(()).unwrap();
-    settle(&sup).await;
-    let report = step_until(&mut sup, 50, |r| r.snapshot.brake_engaged).await;
-    assert_eq!(
-        (tick(&report), hw(&fake)),
-        (
-            joined(Outcome::Applied, S::Recovering, I::None, true),
-            hw_is(true, 1, 0)
-        )
-    );
-}
-
-// Fault 1b (RM-1475): the real probe against a SIGTERM-ignoring fake
-// `nvidia-smi`, at the production deadline. Evaluation runs inside 1 s, fails
-// closed, and SIGKILL frees the gate so the parked brake then lands.
-#[cfg(unix)]
-#[tokio::test]
-async fn sigterm_ignoring_nvidia_smi_cannot_stall_evaluation_past_one_second() {
-    let fake_smi = FakeBinary::install(IGNORES_SIGTERM);
-    let bridge = Arc::new(HardwareBridge::with_health_program_for_test(
-        Some(GpuTarget::from_uuid_for_test(
-            "GPU-12345678-1234-1234-1234-123456789abc",
-        )),
-        fake_smi.path(),
-    ));
-    let fake = Arc::new(FakeActuator::new());
-    let mut sup = harness().actuator(fake.clone()).acquirer(bridge).build();
-    sup.config.acquire_deadline = ACQUIRE_DEADLINE;
-    let parked = Tick {
-        pending: Some(I::Apply),
-        ..unavailable(S::TelemetryMissing, I::Apply, false)
-    };
-
-    let started = Instant::now();
-    let report = sup.step().await;
-    let elapsed = started.elapsed();
-    assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
-    assert_eq!(tick(&report), parked);
-    let exceeded = sup
-        .relay_metrics
-        .lock()
-        .unwrap()
-        .acquire_deadline_exceeded_total;
-    assert_eq!(exceeded, 1);
-
-    // The probe is still dying: later ticks do not wait out another deadline.
-    let started = Instant::now();
-    assert_eq!(tick(&sup.step().await), parked);
-    assert!(started.elapsed() < Duration::from_millis(500));
-
-    wait_gate_free(&sup).await;
-    let report = sup.step().await;
-    assert_eq!(report.source, TelemetrySource::NvmlUnavailable);
-    assert!(report.dispatched, "brake takes the freed gate first");
-    settle(&sup).await;
-    assert_eq!(hw(&fake), hw_is(true, 1, 0));
-}
-
-// A post-actuation re-read shares the step's budget: once it is spent no worker
-// starts and the read fails closed at once.
-#[tokio::test]
-async fn spent_tick_budget_fails_closed_without_starting_a_worker() {
-    let acquirer = Arc::new(ScriptedAcquirer::new([fixtures::healthy_real()]));
-    let mut sup = harness().acquirer(acquirer.clone()).build();
-    sup.tick_deadline = Some(Instant::now());
-
-    let raw = sup.acquire_raw_with_timeout().await;
-
-    assert_eq!(raw.source, TelemetrySource::NvmlUnavailable);
-    assert_eq!(acquirer.calls(), 0);
-    let exceeded = sup
-        .relay_metrics
-        .lock()
-        .unwrap()
-        .acquire_deadline_exceeded_total;
-    assert_eq!(exceeded, 1);
-}
-
-#[tokio::test]
-async fn step_longer_than_its_period_counts_one_overrun() {
-    let acquirer = Arc::new(ScriptedAcquirer::new([fixtures::healthy_real()]));
-    let (release, _entered) = acquirer.hang_until_released();
-    let mut sup = harness().acquirer(acquirer.clone()).build();
-    sup.config.cadence_ms = 1;
-
-    sup.step().await;
-    let overruns = sup.relay_metrics.lock().unwrap().loop_overruns_total;
-    assert_eq!(overruns, 1);
-
-    acquirer.unhang();
-    release.send(()).unwrap();
-}
-
-#[tokio::test]
-async fn software_only_steps_record_no_acquire_failures_or_overruns() {
-    let mut sup = harness().software_only().build();
-    for _ in 0..20 {
-        sup.step().await;
-    }
-    let metrics = sup.relay_metrics.lock().unwrap().clone();
-    assert_eq!(
-        (
-            metrics.acquire_deadline_exceeded_total,
-            metrics.loop_overruns_total
-        ),
-        (0, 0)
-    );
-}
-
-// Fault 2: `sudo -n` denied / nvidia-smi non-zero exit on apply. The
-// supervisor records ActuatorFailure, keeps evaluating, does not release,
-// and retries on the next safety cadence rather than on the failing tick.
-#[tokio::test]
-async fn apply_denied_by_sudo_is_actuator_failure_and_retries_on_cadence() {
-    let fake = Arc::new(FakeActuator::new());
-    fake.set_apply_failure(Some(ActuatorError::CommandFailed(SUDO_DENIED.into())));
-    let mut sup = harness()
-        .actuator(fake.clone())
-        .frames([critical_temp()])
-        .build();
-
-    let report = sup.step().await;
-    assert_eq!(
-        tick(&report),
-        dispatching(S::CriticalBraked, I::Apply, false)
-    );
-    settle(&sup).await;
-
-    // Failure recorded with the exact sudo error; no retry on this tick.
-    let report = step_until(&mut sup, 5, |r| r.actuation.is_some()).await;
-    assert_eq!(
-        tick(&report),
-        joined(Outcome::ApplyFailed, S::ActuatorFailure, I::Apply, false)
-    );
-    assert_eq!(
-        (report.actuation, report.snapshot.last_actuator_error),
-        (
-            Some(ActuatorOutcome::ApplyFailed(sudo_denied())),
-            Some(sudo_denied())
-        )
-    );
-    let exported = sup.relay_metrics.lock().unwrap().safety_state;
-    assert_eq!(
-        (hw(&fake), sup.machine().actuator_failures_total(), exported),
-        (hw_is(false, 1, 0), 1, S::ActuatorFailure)
-    );
-
-    // Retried when the next 1 s eval deadline elapses (11th 100 ms tick
-    // after the first evaluation), and still denied.
-    let report = step_until(&mut sup, 12, |r| r.dispatched).await;
-    assert_eq!(report.step, 11);
-    settle(&sup).await;
-    let report = step_until(&mut sup, 5, |r| r.actuation.is_some()).await;
-    assert_eq!(
-        (report.snapshot.state, hw(&fake)),
-        (S::ActuatorFailure, hw_is(false, 2, 0))
-    );
-
-    // Operator fixes sudoers: the next retry engages the brake and the
-    // overlay clears on the post-apply reassessment.
-    fake.set_apply_failure(None);
-    let _ = step_until(&mut sup, 12, |r| r.dispatched).await;
-    settle(&sup).await;
-    let report = step_until(&mut sup, 5, |r| r.snapshot.brake_engaged).await;
-    assert_eq!(
-        (tick(&report), hw(&fake)),
-        (
-            joined(Outcome::Applied, S::CriticalBraked, I::None, true),
-            hw_is(true, 3, 0)
-        )
-    );
-}
-
-// Fault 3: release fails after the Ok streak. The brake stays claimed on
-// both the machine and the hardware double; no second release is issued
-// on the failing tick, and the retry eventually releases.
-#[tokio::test]
-async fn release_failure_keeps_brake_engaged_and_retries() {
-    let fake = Arc::new(FakeActuator::new());
-    fake.apply_emergency_brake(BRAKE_FRACTION).unwrap();
-    fake.set_release_failure(Some(ActuatorError::CommandFailed(SUDO_DENIED.into())));
-    let mut sup = harness()
-        .actuator(fake.clone())
-        .frames([fixtures::healthy_real()])
-        .build();
-    sup.seed_startup_brake(Some(200), Some(400));
-    let seeded = sup.snapshot();
-    assert_eq!((seeded.brake_engaged, seeded.state), (true, S::Recovering));
-
-    // Evaluations happen at steps 1, 11, 21 → streak of 3 → Release.
-    let report = step_until(&mut sup, 25, |r| r.dispatched).await;
-    assert_eq!(
-        (report.step, tick(&report)),
-        (21, dispatching(S::Recovering, I::Release, true))
-    );
-    settle(&sup).await;
-
-    // Failed release keeps the claim on machine and hardware; no retry
-    // is dispatched on the failing tick.
-    let report = step_until(&mut sup, 5, |r| r.actuation.is_some()).await;
-    assert_eq!(
-        (tick(&report), hw(&fake)),
-        (
-            joined(Outcome::ReleaseFailed, S::ActuatorFailure, I::Release, true),
-            hw_is(true, 1, 1)
-        )
-    );
-
-    fake.set_release_failure(None);
-    let _ = step_until(&mut sup, 12, |r| r.dispatched).await;
-    settle(&sup).await;
-    let report = step_until(&mut sup, 5, |r| !r.snapshot.brake_engaged).await;
-    assert_eq!(
-        (tick(&report), hw(&fake)),
-        (
-            joined(Outcome::Released, S::HealthyReal, I::None, false),
-            hw_is(false, 1, 2)
-        )
-    );
-}
-
-// Fault 4: apply in flight while telemetry turns healthy and the machine
-// stops wanting the brake. No release may overlap the apply; the apply
-// completes, is recorded, and release only after the Ok streak.
-#[tokio::test]
-async fn healthy_telemetry_during_in_flight_apply_never_overlaps_a_release() {
-    let fake = Arc::new(FakeActuator::new());
-    let controlled = Arc::new(ControlledActuator::new(fake.clone()));
-    let (release_apply, apply_entered) = controlled.block_next_apply();
-    let mut sup = harness()
-        .actuator(controlled)
-        .frames([critical_temp(), fixtures::healthy_real()])
-        .build();
-
-    let report = sup.step().await;
-    assert_eq!(
-        tick(&report),
-        dispatching(S::CriticalBraked, I::Apply, false)
-    );
-    apply_entered.recv_timeout(Duration::from_secs(1)).unwrap();
-
-    // The apply worker holds the gate: ticks fail closed to NvmlUnavailable
-    // and evaluate every tick, but never spawn a second worker.
-    let blocked = Tick {
-        in_flight: InFlightActuation::Apply,
-        ..unavailable(S::TelemetryMissing, I::Apply, false)
-    };
-    for _ in 0..12 {
-        let report = sup.step().await;
-        assert_eq!(
-            (tick(&report), sup.release_task.is_some()),
-            (blocked, false),
-            "release must not overlap apply"
-        );
-    }
-    assert_eq!(hw(&fake), hw_is(false, 0, 0));
-
-    // Post-apply reassessment saw healthy real telemetry: Recovering, no
-    // release yet (hysteresis), and nothing dispatched this tick.
-    release_apply.send(()).unwrap();
-    settle(&sup).await;
-    let report = step_until(&mut sup, 5, |r| r.actuation.is_some()).await;
-    assert_eq!(
-        (tick(&report), hw(&fake)),
-        (
-            joined(Outcome::Applied, S::Recovering, I::None, true),
-            hw_is(true, 1, 0)
-        )
-    );
-
-    // Ok streak completes on cadence; exactly one release follows.
-    let report = step_until(&mut sup, 40, |r| r.in_flight == InFlightActuation::Release).await;
-    assert_eq!(tick(&report), dispatching(S::Recovering, I::Release, true));
-    settle(&sup).await;
-    let report = step_until(&mut sup, 5, |r| !r.snapshot.brake_engaged).await;
-    assert_eq!(
-        (tick(&report), hw(&fake)),
-        (
-            joined(Outcome::Released, S::HealthyReal, I::None, false),
-            hw_is(false, 1, 1)
-        )
-    );
-}
-
-// Fault 5: the blocking actuator worker panics. The supervisor must
-// survive, record an apply failure, and keep its intent.
-#[tokio::test]
-async fn panicking_actuator_worker_is_recorded_as_apply_failure() {
-    let fake = Arc::new(FakeActuator::new());
-    let controlled = Arc::new(ControlledActuator::new(fake.clone()));
-    controlled.panic_on_apply();
-    let mut sup = harness()
-        .actuator(controlled)
-        .frames([critical_temp()])
-        .build();
-
-    let report = sup.step().await;
-    assert_eq!(
-        tick(&report),
-        dispatching(S::CriticalBraked, I::Apply, false)
-    );
-    settle(&sup).await;
-    let report = step_until(&mut sup, 5, |r| r.actuation.is_some()).await;
-    assert_eq!(
-        tick(&report),
-        joined(Outcome::ApplyFailed, S::ActuatorFailure, I::Apply, false)
-    );
-    // Counted once, the fake was never reached, and the gate permit was
-    // dropped with the panicking worker.
-    assert_eq!(
-        (
-            sup.machine().actuator_failures_total(),
-            hw(&fake),
-            sup.gate.try_enter().is_ok()
-        ),
-        (1, hw_is(false, 0, 0), true)
-    );
-}
-
 // Fault 6: slow consumer on the sensory publisher. Safety steps stay fast,
 // publication attempts continue every tick, the bounded queue drops rather
 // than grows, and state transitions are unaffected.
@@ -1198,40 +837,6 @@ async fn simulated_source_holds_leftover_brake_and_never_releases() {
         (hw_is(true, 1, 0), true, true),
         "brake held on hardware, operator warned, metrics report it"
     );
-}
-
-// Fault 8: the post-apply telemetry re-read hangs. The step stays bounded,
-// the Applied outcome is still recorded, and the re-read fail-closes.
-#[tokio::test]
-async fn hung_post_actuation_reread_is_bounded_and_fail_closed() {
-    let fake = Arc::new(FakeActuator::new());
-    let acquirer = Arc::new(ScriptedAcquirer::new([critical_temp()]));
-    let mut sup = harness()
-        .actuator(fake.clone())
-        .acquirer(acquirer.clone())
-        .build();
-
-    let report = sup.step().await;
-    assert_eq!(
-        tick(&report),
-        dispatching(S::CriticalBraked, I::Apply, false)
-    );
-    settle(&sup).await;
-    let (release, _entered) = acquirer.hang_until_released();
-
-    let started = Instant::now();
-    let report = step_until(&mut sup, 5, |r| r.actuation.is_some()).await;
-    let bounded = started.elapsed() < Duration::from_secs(1);
-    let reread_fail_closed = Tick {
-        source: TelemetrySource::NvmlUnavailable,
-        ..joined(Outcome::Applied, S::TelemetryMissing, I::None, true)
-    };
-    assert_eq!(
-        (bounded, tick(&report), hw(&fake)),
-        (true, reread_fail_closed, hw_is(true, 1, 0))
-    );
-    acquirer.unhang();
-    release.send(()).unwrap();
 }
 
 // The shutdown path on top of the same supervisor: SIGINT during an
@@ -1371,7 +976,7 @@ async fn skipped_release_worker_records_nothing() {
     }));
     settle(&sup).await;
 
-    let outcome = sup.reconcile_finished(ActuationKind::Release).await;
+    let outcome = sup.reconcile_finished(ActuationKind::Release, true).await;
     assert_eq!(outcome, None);
     assert!(!sup.release_superseded.load(Ordering::Acquire));
     assert!(sup.release_task.is_none());

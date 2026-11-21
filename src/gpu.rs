@@ -47,6 +47,12 @@ const HEALTH_PROBE_INTERVAL: Duration = Duration::from_secs(30);
 /// to this long after the driver recovers, and a wedged driver accumulates at
 /// most one unkillable (uninterruptible) `nvidia-smi` per interval.
 const HEALTH_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+/// Longest a probe may stay in flight before it is abandoned. `timeout -k`
+/// exits within ~2 s for any killable child, so an older probe is a child in
+/// uninterruptible sleep: its slot is freed and the verdict failed closed so
+/// a stale "healthy" cannot be served forever, while the straggler still
+/// records its verdict whenever it eventually returns.
+const PROBE_ABANDON_AFTER: Duration = Duration::from_secs(10);
 
 // ── GPU identity (GH#70 / RM-1850) ──────────────────────────────────
 
@@ -254,6 +260,17 @@ impl GpuHealth {
     fn check(self: &Arc<Self>, now: Instant) -> bool {
         let (plan, cached) = {
             let mut state = self.state.lock().unwrap();
+            // A probe that outlived its kill bound is wedged: fail closed and
+            // free the slot so a retry can run, rather than serving the stale
+            // verdict while the straggler sits in uninterruptible sleep.
+            if state.in_flight
+                && state.last_started.is_some_and(|started| {
+                    now.saturating_duration_since(started) >= PROBE_ABANDON_AFTER
+                })
+            {
+                state.in_flight = false;
+                state.healthy = Some(false);
+            }
             let plan = plan_health_probe(&state, now);
             if plan != ProbePlan::UseCached {
                 state.in_flight = true;
@@ -1169,6 +1186,28 @@ mod health_probe_tests {
             running.in_flight = true;
             assert_eq!(plan_health_probe(&running, now), ProbePlan::UseCached);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_past_its_kill_bound_is_abandoned_and_fails_closed() {
+        let fake = FakeBinary::install("exit 0\n");
+        let health = Arc::new(GpuHealth::new(fake.path()));
+        {
+            let mut state = health.state.lock().unwrap();
+            // A stale "healthy" verdict with a probe that outlived its kill
+            // bound — the child is wedged in uninterruptible sleep.
+            state.healthy = Some(true);
+            state.in_flight = true;
+            state.last_started =
+                Some(Instant::now() - PROBE_ABANDON_AFTER - Duration::from_secs(1));
+        }
+        // The stale verdict is not served: the call fails closed and frees
+        // the slot so a retry can find the driver again.
+        assert!(!health.check(Instant::now()));
+        assert!(health.state.lock().unwrap().in_flight);
+        // The replacement probe is a fast success: the verdict recovers.
+        assert_eq!(wait_for_verdict(&health), Some(true));
     }
 
     #[cfg(unix)]

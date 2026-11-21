@@ -136,9 +136,11 @@ fn pid_is_alive(pid: u32) -> bool {
             return std::io::Error::last_os_error().raw_os_error() != Some(ERROR_INVALID_PARAMETER);
         }
         let mut code = 0;
-        let alive = GetExitCodeProcess(handle, &mut code) == 0 || code == STILL_ACTIVE;
+        let queried = GetExitCodeProcess(handle, &mut code) != 0;
         CloseHandle(handle);
-        alive
+        // A failed query cannot prove the process dead; only an observed
+        // exit code other than STILL_ACTIVE can. Unresolvable stays alive.
+        !queried || code == STILL_ACTIVE
     }
 }
 

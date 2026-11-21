@@ -239,30 +239,60 @@ impl Supervisor {
             dispatched |= self.dispatch_due_or_pending(false);
         }
 
+        // Reconcile workers that finished during the sleep BEFORE this
+        // step's read: the upcoming acquire already post-dates their
+        // completion, so it doubles as the mandatory post-actuation
+        // verification instead of spending the shared budget on a second
+        // read of the same state. At most one worker is ever in flight,
+        // so at most one slot settles.
+        let mut actuation = None;
+        let mut deferred_verify = false;
+        for kind in [ActuationKind::Apply, ActuationKind::Release] {
+            let outcome = self.reconcile_finished(kind, false).await;
+            deferred_verify |= outcome.as_ref().is_some_and(outcome_succeeded);
+            actuation = outcome.or(actuation);
+        }
+
         let raw = self.acquire_raw_with_timeout().await;
         let telemetry = self.assess(&raw);
 
-        // Reconcile workers that finished during the sleep. A success already
-        // re-read and re-evaluated telemetry; a failure is recorded as-is.
-        // At most one worker is ever in flight, so at most one slot settles.
-        let mut actuation = None;
+        // A worker that finished during the acquire cannot trust the frame
+        // above — it may predate completion — so it still pays for its own
+        // re-read out of what budget remains.
         for kind in [ActuationKind::Apply, ActuationKind::Release] {
-            actuation = self.reconcile_finished(kind).await.or(actuation);
+            actuation = self.reconcile_finished(kind, true).await.or(actuation);
         }
         let succeeded = actuation.as_ref().is_some_and(outcome_succeeded);
         let failed = actuation.is_some() && !succeeded;
 
         let now_ms = (self.monotonic)();
-        let cadence_due = self
-            .last_eval_ms
-            .is_none_or(|last| now_ms.saturating_sub(last) >= self.config.eval_interval_ms);
-        if cadence_due {
-            self.last_eval_ms = Some(now_ms);
-        }
-        let dispatch_due = succeeded || self.evaluate_or_publish(cadence_due, &telemetry, failed);
+        // A worker joined before this read is verified by evaluating the
+        // fresh frame now; a worker joined during the read already evaluated
+        // its own re-read, so the tick frame must not be evaluated a second
+        // time — it is published only via the normal cadence path below.
+        let eval_due = deferred_verify
+            || self
+                .last_eval_ms
+                .is_none_or(|last| now_ms.saturating_sub(last) >= self.config.eval_interval_ms);
+        let eval_dispatch = if succeeded && !deferred_verify {
+            false
+        } else {
+            if eval_due {
+                self.last_eval_ms = Some(now_ms);
+            }
+            self.evaluate_or_publish(eval_due, &telemetry, failed)
+        };
+        let dispatch_due = succeeded || eval_dispatch;
         self.supersede_release_if_apply();
         dispatched |= self.dispatch_due_or_pending(dispatch_due);
 
+        let snapshot = self.machine.snapshot();
+        if self.config.dashboard {
+            print_dashboard(&telemetry, step_count, snapshot.state);
+        }
+
+        // Measure after the dashboard flush so a slow stdout counts toward
+        // the step duration the same way it consumes the caller's interval.
         {
             let mut metrics = self.relay_metrics.lock().unwrap();
             metrics.telemetry_acquired_at = Some(telemetry.acquired_at);
@@ -272,11 +302,7 @@ impl Supervisor {
                 Duration::from_millis(self.config.cadence_ms),
             );
         }
-
-        let snapshot = self.machine.snapshot();
-        if self.config.dashboard {
-            print_dashboard(&telemetry, step_count, snapshot.state);
-        }
+        self.tick_deadline = None;
 
         StepReport {
             step: step_count,
@@ -290,9 +316,17 @@ impl Supervisor {
     }
 
     /// Join the worker in `kind`'s slot if it has finished. On success the
-    /// outcome is recorded and telemetry is re-read and re-evaluated before
-    /// any further dispatch; on failure only the outcome is recorded.
-    async fn reconcile_finished(&mut self, kind: ActuationKind) -> Option<ActuatorOutcome> {
+    /// outcome is recorded and — only when `reverify` is set — telemetry is
+    /// re-read and re-evaluated before any further dispatch; callers pass
+    /// `false` when their upcoming acquire is already guaranteed to post-date
+    /// the completion, folding verification into that read rather than paying
+    /// for a duplicate out of the same budget. On failure only the outcome is
+    /// recorded.
+    async fn reconcile_finished(
+        &mut self,
+        kind: ActuationKind,
+        reverify: bool,
+    ) -> Option<ActuatorOutcome> {
         let slot = match kind {
             ActuationKind::Apply => &mut self.brake_task,
             ActuationKind::Release => &mut self.release_task,
@@ -311,11 +345,10 @@ impl Supervisor {
             }
         }
         let outcome = actuation_outcome(kind, joined);
-        if outcome_succeeded(&outcome) {
-            self.reassess_after_actuation(outcome.clone()).await;
-        } else {
-            let snap = self.machine.record_actuator(outcome.clone());
-            self.store_safety(&snap);
+        let snap = self.machine.record_actuator(outcome.clone());
+        self.store_safety(&snap);
+        if reverify && outcome_succeeded(&outcome) {
+            self.reverify_after_actuation().await;
         }
         Some(outcome)
     }
@@ -395,11 +428,9 @@ impl Supervisor {
         }
     }
 
-    /// Reassess telemetry after either successful hardware mutation before
-    /// dispatching any further safety intent.
-    async fn reassess_after_actuation(&mut self, outcome: ActuatorOutcome) {
-        let snap = self.machine.record_actuator(outcome);
-        self.store_safety(&snap);
+    /// Re-read telemetry after a successful hardware mutation and evaluate it
+    /// before dispatching any further safety intent.
+    async fn reverify_after_actuation(&mut self) {
         let raw = self.acquire_raw_with_timeout().await;
         let frame = self.assess(&raw);
         // This reassessment is a real evaluation: restart the deadline so the

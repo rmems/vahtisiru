@@ -156,9 +156,11 @@ fn platform_pid_is_alive(pid: u32) -> bool {
             return std::io::Error::last_os_error().raw_os_error() != Some(ERROR_INVALID_PARAMETER);
         }
         let mut code = 0;
-        let alive = GetExitCodeProcess(handle, &mut code) == 0 || code == STILL_ACTIVE;
+        let queried = GetExitCodeProcess(handle, &mut code) != 0;
         CloseHandle(handle);
-        alive
+        // A failed query cannot prove the process dead; only an observed
+        // exit code other than STILL_ACTIVE can. Unresolvable stays alive.
+        !queried || code == STILL_ACTIVE
     }
 }
 
@@ -370,6 +372,26 @@ pub async fn run(prepared: &mut SupervisorStart) -> Result<(), Box<dyn std::erro
     );
     supervisor.seed_startup_brake(current_w, default_w);
 
+    let shutdown_reason =
+        run_loop(&mut supervisor, Duration::from_millis(cli.step_interval_ms)).await?;
+
+    let _plan = supervisor
+        .shutdown(shutdown_reason, &metrics_shutdown_tx, metrics_task)
+        .await;
+    eprintln!("[relay] runtime stopping; process lock remains held through shutdown");
+
+    Ok(())
+}
+
+/// The supervisor's steady-state loop: step, then sleep only the remainder of
+/// the interval measured from the tick's start, so a slow tick starts the next
+/// step immediately instead of drifting a full extra interval late (an overrun
+/// is counted by `record_step_duration`, never slept off). Returns why it
+/// stopped.
+async fn run_loop(
+    supervisor: &mut Supervisor,
+    interval: Duration,
+) -> Result<ShutdownReason, Box<dyn std::error::Error>> {
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
     // SIGTERM only exists on unix; elsewhere the wait pends forever and
@@ -383,8 +405,7 @@ pub async fn run(prepared: &mut SupervisorStart) -> Result<(), Box<dyn std::erro
     let sigterm_wait = std::future::pending::<Option<()>>();
     tokio::pin!(sigterm_wait);
 
-    let interval = Duration::from_millis(cli.step_interval_ms);
-    let shutdown_reason = loop {
+    Ok(loop {
         let tick_started = Instant::now();
         let report = supervisor.step().await;
         tracing::debug!(
@@ -399,12 +420,7 @@ pub async fn run(prepared: &mut SupervisorStart) -> Result<(), Box<dyn std::erro
             "supervisor step"
         );
 
-        // Sleep only the remainder of the interval measured from tick start:
-        // a fast tick still waits ~`step_interval_ms` (no busy loop), while an
-        // overrun — counted by `record_step_duration` — starts the next step
-        // immediately instead of drifting a full extra interval late.
         let pause = interval.saturating_sub(tick_started.elapsed());
-
         tokio::select! {
             _ = &mut ctrl_c => {
                 break ShutdownReason::Sigint;
@@ -414,14 +430,7 @@ pub async fn run(prepared: &mut SupervisorStart) -> Result<(), Box<dyn std::erro
             }
             _ = sleep(pause) => {}
         }
-    };
-
-    let _plan = supervisor
-        .shutdown(shutdown_reason, &metrics_shutdown_tx, metrics_task)
-        .await;
-    eprintln!("[relay] runtime stopping; process lock remains held through shutdown");
-
-    Ok(())
+    })
 }
 
 /// Perform an explicit, read-only validation of the same GPU adapters used by
