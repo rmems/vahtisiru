@@ -12,7 +12,7 @@
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 
 use crate::cpu::{self, RelayMetrics};
@@ -33,8 +33,12 @@ use crate::telemetry::{
     UnixMillis, assess_with_clock,
 };
 
-/// Bound on any single NVML wait (telemetry read, startup query, actuation).
+/// Bound on a startup or smoke-test NVML wait, before the safety loop runs.
 pub(crate) const NVML_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Wall-clock budget for all telemetry waits in one step. Overrun is
+/// `NvmlUnavailable`, so fail-closed evaluation runs within 1 s of the step start.
+pub(crate) const ACQUIRE_DEADLINE: Duration = Duration::from_millis(900);
 
 /// Blocking raw-telemetry source. Production is [`HardwareBridge`] (NVML);
 /// tests inject scripted frames or a worker that hangs.
@@ -73,8 +77,8 @@ pub(crate) struct SupervisorConfig {
     pub cadence_ms: u64,
     /// Wall-clock safety-evaluation period (ms), independent of tick length.
     pub eval_interval_ms: u64,
-    /// Bound on each gated NVML wait.
-    pub nvml_timeout: Duration,
+    /// Budget shared by every gated telemetry wait in one step.
+    pub acquire_deadline: Duration,
     /// Print the live dashboard line to stdout each step.
     pub dashboard: bool,
 }
@@ -134,6 +138,8 @@ pub(crate) struct Supervisor {
     pending_intent: Option<BrakeIntent>,
     step_count: u64,
     last_eval_ms: Option<u64>,
+    /// When this step's acquisition budget runs out.
+    tick_deadline: Option<Instant>,
     /// Set when policy wants the brake (`desired_brake`) while a Release is in
     /// flight: a release not yet at the driver is skipped without being recorded.
     release_superseded: Arc<AtomicBool>,
@@ -159,6 +165,7 @@ impl Supervisor {
             pending_intent: None,
             step_count: 0,
             last_eval_ms: None,
+            tick_deadline: None,
             release_superseded: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -219,6 +226,8 @@ impl Supervisor {
     /// gate-bounded telemetry read and joining a worker that has already
     /// finished. Sleeping between ticks is the caller's job.
     pub(crate) async fn step(&mut self) -> StepReport {
+        let started = Instant::now();
+        self.tick_deadline = Some(started + self.config.acquire_deadline);
         self.step_count += 1;
         let step_count = self.step_count;
         let mut dispatched = false;
@@ -230,39 +239,61 @@ impl Supervisor {
             dispatched |= self.dispatch_due_or_pending(false);
         }
 
+        // Reconcile workers that finished during the sleep BEFORE this
+        // step's read: the upcoming acquire already post-dates their
+        // completion, so it doubles as the mandatory post-actuation
+        // verification instead of spending the shared budget on a second
+        // read of the same state.
+        let (mut actuation, deferred_verify) = self.reconcile_slots(false).await;
+
         let raw = self.acquire_raw_with_timeout().await;
         let telemetry = self.assess(&raw);
 
-        // Reconcile workers that finished during the sleep. A success already
-        // re-read and re-evaluated telemetry; a failure is recorded as-is.
-        // At most one worker is ever in flight, so at most one slot settles.
-        let mut actuation = None;
-        for kind in [ActuationKind::Apply, ActuationKind::Release] {
-            actuation = self.reconcile_finished(kind).await.or(actuation);
-        }
+        // A worker that finished during the acquire cannot trust the frame
+        // above — it may predate completion — so it still pays for its own
+        // re-read out of what budget remains.
+        actuation = self.reconcile_slots(true).await.0.or(actuation);
         let succeeded = actuation.as_ref().is_some_and(outcome_succeeded);
         let failed = actuation.is_some() && !succeeded;
 
         let now_ms = (self.monotonic)();
-        let cadence_due = self
-            .last_eval_ms
-            .is_none_or(|last| now_ms.saturating_sub(last) >= self.config.eval_interval_ms);
-        if cadence_due {
-            self.last_eval_ms = Some(now_ms);
-        }
-        let dispatch_due = succeeded || self.evaluate_or_publish(cadence_due, &telemetry, failed);
+        // A worker joined before this read is verified by evaluating the
+        // fresh frame now; a worker joined during the read already evaluated
+        // its own re-read, which also drove this tick's publication — the tick
+        // frame is neither evaluated nor published a second time.
+        let eval_due = deferred_verify
+            || self
+                .last_eval_ms
+                .is_none_or(|last| now_ms.saturating_sub(last) >= self.config.eval_interval_ms);
+        let eval_dispatch = if succeeded && !deferred_verify {
+            false
+        } else {
+            if eval_due {
+                self.last_eval_ms = Some(now_ms);
+            }
+            self.evaluate_or_publish(eval_due, &telemetry, failed)
+        };
+        let dispatch_due = succeeded || eval_dispatch;
         self.supersede_release_if_apply();
         dispatched |= self.dispatch_due_or_pending(dispatch_due);
-
-        {
-            let mut metrics = self.relay_metrics.lock().unwrap();
-            metrics.telemetry_acquired_at = Some(telemetry.acquired_at);
-        }
 
         let snapshot = self.machine.snapshot();
         if self.config.dashboard {
             print_dashboard(&telemetry, step_count, snapshot.state);
         }
+
+        // Measure after the dashboard flush so a slow stdout counts toward
+        // the step duration the same way it consumes the caller's interval.
+        {
+            let mut metrics = self.relay_metrics.lock().unwrap();
+            metrics.telemetry_acquired_at = Some(telemetry.acquired_at);
+            cpu::record_step_duration(
+                &mut metrics,
+                started.elapsed(),
+                Duration::from_millis(self.config.cadence_ms),
+            );
+        }
+        self.tick_deadline = None;
 
         StepReport {
             step: step_count,
@@ -275,10 +306,33 @@ impl Supervisor {
         }
     }
 
+    /// Join every finished actuation worker (at most one is ever in flight).
+    /// Returns the joined outcome and whether a success was recorded while
+    /// `reverify` was `false` — the caller then owes it a verification eval on
+    /// a frame that post-dates the completion.
+    async fn reconcile_slots(&mut self, reverify: bool) -> (Option<ActuatorOutcome>, bool) {
+        let mut actuation = None;
+        let mut needs_verify = false;
+        for kind in [ActuationKind::Apply, ActuationKind::Release] {
+            let outcome = self.reconcile_finished(kind, reverify).await;
+            needs_verify |= !reverify && outcome.as_ref().is_some_and(outcome_succeeded);
+            actuation = outcome.or(actuation);
+        }
+        (actuation, needs_verify)
+    }
+
     /// Join the worker in `kind`'s slot if it has finished. On success the
-    /// outcome is recorded and telemetry is re-read and re-evaluated before
-    /// any further dispatch; on failure only the outcome is recorded.
-    async fn reconcile_finished(&mut self, kind: ActuationKind) -> Option<ActuatorOutcome> {
+    /// outcome is recorded and — only when `reverify` is set — telemetry is
+    /// re-read and re-evaluated before any further dispatch; callers pass
+    /// `false` when their upcoming acquire is already guaranteed to post-date
+    /// the completion, folding verification into that read rather than paying
+    /// for a duplicate out of the same budget. On failure only the outcome is
+    /// recorded.
+    async fn reconcile_finished(
+        &mut self,
+        kind: ActuationKind,
+        reverify: bool,
+    ) -> Option<ActuatorOutcome> {
         let slot = match kind {
             ActuationKind::Apply => &mut self.brake_task,
             ActuationKind::Release => &mut self.release_task,
@@ -297,11 +351,10 @@ impl Supervisor {
             }
         }
         let outcome = actuation_outcome(kind, joined);
-        if outcome_succeeded(&outcome) {
-            self.reassess_after_actuation(outcome.clone()).await;
-        } else {
-            let snap = self.machine.record_actuator(outcome.clone());
-            self.store_safety(&snap);
+        let snap = self.machine.record_actuator(outcome.clone());
+        self.store_safety(&snap);
+        if reverify && outcome_succeeded(&outcome) {
+            self.reverify_after_actuation().await;
         }
         Some(outcome)
     }
@@ -349,32 +402,49 @@ impl Supervisor {
         )
     }
 
-    /// Bounded single-flight acquisition for both per-tick and post-actuation reads.
+    /// Bounded single-flight acquisition for both per-tick and post-actuation
+    /// reads. Both draw on one per-step budget, so a post-actuation read cannot
+    /// stretch the step past the deadline; a spent budget starts no worker.
     async fn acquire_raw_with_timeout(&mut self) -> RawTelemetry {
         if self.config.force_software_only {
             return self.acquirer.acquire_raw(true);
         }
-        let acquirer = Arc::clone(&self.acquirer);
-        let result = self
-            .gate
-            .run(self.config.nvml_timeout, move || {
-                acquirer.acquire_raw(false)
-            })
-            .await;
+        let budget = self
+            .tick_deadline
+            .map_or(self.config.acquire_deadline, |end| {
+                end.saturating_duration_since(Instant::now())
+            });
+        let result = if budget.is_zero() {
+            Err(NvmlRunError::TimedOut)
+        } else {
+            let acquirer = Arc::clone(&self.acquirer);
+            self.gate
+                .run(budget, move || acquirer.acquire_raw(false))
+                .await
+        };
         if should_log_acquisition_error(&mut self.warned_nvml_busy, result.as_ref().err()) {
             tracing::warn!(error = ?result.as_ref().err(), "NVML acquisition unavailable; treating as unavailable");
         }
         match result {
-            Ok(raw) => raw,
-            Err(_) => RawTelemetry::nvml_unavailable((self.clock)()),
+            Ok(raw) => {
+                // A successful worker can still report the driver unavailable
+                // (unhealthy probe verdict or NVML read failure): count it so
+                // the failure counter is not blind to driver-side serves.
+                if raw.source == TelemetrySource::NvmlUnavailable {
+                    cpu::record_driver_unavailable();
+                }
+                raw
+            }
+            Err(err) => {
+                cpu::record_acquire_failure(&mut self.relay_metrics.lock().unwrap(), err);
+                RawTelemetry::nvml_unavailable((self.clock)())
+            }
         }
     }
 
-    /// Reassess telemetry after either successful hardware mutation before
-    /// dispatching any further safety intent.
-    async fn reassess_after_actuation(&mut self, outcome: ActuatorOutcome) {
-        let snap = self.machine.record_actuator(outcome);
-        self.store_safety(&snap);
+    /// Re-read telemetry after a successful hardware mutation and evaluate it
+    /// before dispatching any further safety intent.
+    async fn reverify_after_actuation(&mut self) {
         let raw = self.acquire_raw_with_timeout().await;
         let frame = self.assess(&raw);
         // This reassessment is a real evaluation: restart the deadline so the

@@ -106,6 +106,41 @@ frame is evaluated on every tick, and every successful actuator task triggers a
 fresh-frame reassessment. Failed apply/release is recorded and retried on the
 deadline rather than every tick.
 
+Telemetry acquisition cannot hold evaluation back. All telemetry waits in one
+step share a 900 ms wall-clock budget (`ACQUIRE_DEADLINE`). A wait that
+overruns is `NvmlUnavailable`, so a wedged driver is evaluated fail-closed
+within **1 s** of the step start, and later ticks find the gate busy and
+evaluate without waiting again. The budget bounds the *driver waits* only —
+deterministic in-process work (joining finished workers, logging, the
+evaluation itself) is not wall-clock bounded. See the limits below for when
+the brake lands.
+
+A successful actuation that settled during the inter-tick sleep is verified
+by that step's regular read — the read already post-dates the completion, so
+it doubles as the mandatory post-actuation verification rather than paying
+for a second read out of the same budget. Only a worker that finished
+mid-read takes a second, still budget-bounded, re-read.
+
+The run loop paces steps from each step's start: it sleeps only the remainder
+of `--step-interval-ms`, so a slow step starts the next one immediately instead
+of drifting a full extra interval late (an overrun is counted in
+`supervisor_loop_overruns_total`, never slept off).
+
+Driver health is `timeout -k 1s 1s nvidia-smi -L`: SIGTERM at 1 s, SIGKILL at
+2 s. A failed or killed probe is `NvmlUnavailable`. The verdict is cached: the
+first probe runs at startup when a GPU target resolved (off the NVML gate, so a
+wedged child cannot pin the gate), then one re-probe every 30 s while healthy and
+every 5 s after a failure, on a detached thread so it never consumes the
+acquisition budget. A wedged `nvidia-smi` can therefore go unnoticed for up to
+about 32 s while NVML keeps returning real readings, and the relay stays
+fail-closed for up to 5 s after the driver recovers. A hung NVML call does not
+depend on the probe: the acquisition deadline bounds it directly. A probe that
+outlives its own kill bound (a child stuck in uninterruptible sleep), including
+the startup probe, is abandoned after 10 s: the cached verdict fails closed and
+a retry is allowed, so a stale "healthy" cannot be served forever and at most
+one unkillable straggler piles up per retry. A late result from an abandoned
+probe is discarded, so it cannot overwrite the replacement's verdict.
+
 If policy wants the brake (`desired_brake`) while a **Release** is in flight,
 the release is flagged superseded: a worker that has not yet reached the driver
 skips it. A call already inside `nvidia-smi -pl` cannot be interrupted, so it
@@ -275,6 +310,9 @@ Exported without querying Brainstem:
 | `safety_actuator_failures_total` | counter | apply/release errors |
 | `safety_trips_total{reason}` | counter | deterministic trip events (one per fail-closed episode, see above); closed `SafetyReason` label set, all pre-registered at 0 |
 | `telemetry_freshness_s` | gauge | sample age at scrape time (monotonic receive instant) |
+| `telemetry_acquire_failures_total{reason}` | counter | real reads served as `NvmlUnavailable`; closed set `deadline_exceeded`, `gate_busy`, `worker_failed`, `driver_unavailable` (no resolved GPU target, unhealthy probe verdict, or NVML read failure inside a completed worker), all pre-registered at 0 |
+| `supervisor_step_duration_seconds` | gauge | duration of the last supervisor step, excluding the sleep between steps |
+| `supervisor_loop_overruns_total` | counter | steps that took longer than `--step-interval-ms` |
 | `sensory_queue_depth` | gauge | frames currently buffered |
 | `sensory_queue_capacity` | gauge | configured finite capacity |
 | `sensory_queue_enqueued_total` | counter | frames accepted into the queue |

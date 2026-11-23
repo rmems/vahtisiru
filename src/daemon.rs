@@ -8,7 +8,7 @@
 use clap::Parser;
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 use crate::actuation_smoke::{
@@ -28,12 +28,14 @@ use crate::safety::{
 };
 use crate::shutdown::ShutdownReason;
 use crate::supervisor::{
-    NVML_TIMEOUT, Supervisor, SupervisorConfig, SupervisorParts, monotonic_ms_clock,
+    ACQUIRE_DEADLINE, NVML_TIMEOUT, Supervisor, SupervisorConfig, SupervisorParts,
+    monotonic_ms_clock,
 };
 use crate::telemetry::{
     SAFETY_EVAL_CADENCE_MS, SampleClock, SampleValidity, TelemetrySample, TelemetrySource,
     assess_with_clock, unix_now_ms,
 };
+#[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 
 #[derive(Debug)]
@@ -72,7 +74,7 @@ fn try_acquire_lock(lock_path: &str) -> Result<LockGuard, String> {
                     ));
                 };
 
-                if std::path::Path::new(&format!("/proc/{recorded_pid}")).exists() {
+                if recorded_pid_is_alive(recorded_pid) {
                     return Err(format!(
                         "Another instance is already active (PID: {recorded_pid})."
                     ));
@@ -91,12 +93,81 @@ fn try_acquire_lock(lock_path: &str) -> Result<LockGuard, String> {
     }
 }
 
-const PROCESS_LOCK_PATH: &str = "/tmp/vahtisiru.lock";
+/// Directory holding the single-instance lock: `/tmp` on unix (the documented
+/// contract), the OS temp dir elsewhere so non-unix dev hosts get the same
+/// single-instance rule without a missing `/tmp`.
+fn lock_dir() -> std::path::PathBuf {
+    #[cfg(unix)]
+    {
+        std::path::PathBuf::from("/tmp")
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::temp_dir()
+    }
+}
+
+fn process_lock_path() -> String {
+    lock_dir()
+        .join("vahtisiru.lock")
+        .to_string_lossy()
+        .into_owned()
+}
 
 /// Pre-rename lock path kept for upgrade safety: while a legacy `thalamic-relay`
 /// process may still hold it, a new `vahtisiru` instance must not start, or two
 /// supervisors could actuate the same GPU concurrently.
-const LEGACY_PROCESS_LOCK_PATH: &str = "/tmp/thalamic_relay.lock";
+fn legacy_process_lock_path() -> String {
+    lock_dir()
+        .join("thalamic_relay.lock")
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// True when `recorded_pid` names a process that is still running. PID 0 is
+/// never a lock-holder; anything unresolvable counts as alive so a live lock
+/// is never reclaimed on a guess (see [`try_acquire_lock`]).
+fn recorded_pid_is_alive(recorded_pid: u32) -> bool {
+    recorded_pid != 0 && platform_pid_is_alive(recorded_pid)
+}
+
+#[cfg(unix)]
+fn platform_pid_is_alive(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+#[cfg(windows)]
+fn platform_pid_is_alive(pid: u32) -> bool {
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const ERROR_INVALID_PARAMETER: i32 = 87;
+    const STILL_ACTIVE: u32 = 259;
+    // kernel32 is linked into every Windows process already, so the lock's
+    // liveness check needs no extra crates on a dev checkout.
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut core::ffi::c_void;
+        fn GetExitCodeProcess(process: *mut core::ffi::c_void, code: *mut u32) -> i32;
+        fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
+    }
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            // Only "no such process" proves the recorded PID dead; access
+            // denied on a live process must not reclaim its lock.
+            return std::io::Error::last_os_error().raw_os_error() != Some(ERROR_INVALID_PARAMETER);
+        }
+        let mut code = 0;
+        let queried = GetExitCodeProcess(handle, &mut code) != 0;
+        CloseHandle(handle);
+        // A failed query cannot prove the process dead; only an observed
+        // exit code other than STILL_ACTIVE can. Unresolvable stays alive.
+        !queried || code == STILL_ACTIVE
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn platform_pid_is_alive(_pid: u32) -> bool {
+    true
+}
 
 /// Refuse to start while a pre-rename `thalamic-relay` instance is alive (or its
 /// lock is ambiguous); clears the legacy lock once the recorded PID is dead.
@@ -113,7 +184,7 @@ fn check_legacy_lock(legacy_path: &str) -> Result<(), String> {
             "Legacy lock {legacy_path} is unreadable/unparseable; refusing to start."
         ));
     };
-    if std::path::Path::new(&format!("/proc/{recorded_pid}")).exists() {
+    if recorded_pid_is_alive(recorded_pid) {
         return Err(format!(
             "A pre-rename thalamic-relay instance is already active (PID: {recorded_pid})."
         ));
@@ -171,11 +242,11 @@ pub fn prepare() -> Result<SupervisorStart, Box<dyn std::error::Error>> {
 
     // Block while a pre-rename instance still holds its legacy lock, then
     // acquire the process lock before any potentially blocking driver call.
-    if let Err(msg) = check_legacy_lock(LEGACY_PROCESS_LOCK_PATH) {
+    if let Err(msg) = check_legacy_lock(&legacy_process_lock_path()) {
         eprintln!("[relay] FATAL: {msg}");
         std::process::exit(1);
     }
-    let lock_guard = match try_acquire_lock(PROCESS_LOCK_PATH) {
+    let lock_guard = match try_acquire_lock(&process_lock_path()) {
         Ok(guard) => guard,
         Err(msg) => {
             eprintln!("[relay] FATAL: {msg}");
@@ -202,7 +273,7 @@ fn supervisor_config(cli: &Cli) -> SupervisorConfig {
         force_software_only: cli.force_software_only,
         cadence_ms: cli.step_interval_ms,
         eval_interval_ms: SAFETY_EVAL_CADENCE_MS,
-        nvml_timeout: NVML_TIMEOUT,
+        acquire_deadline: ACQUIRE_DEADLINE,
         dashboard: true,
     }
 }
@@ -222,6 +293,7 @@ pub async fn run(prepared: &mut SupervisorStart) -> Result<(), Box<dyn std::erro
     let target = resolve_gpu_target(&nvml_gate).await;
 
     let bridge = Arc::new(HardwareBridge::new(target.clone()));
+    let has_target = target.is_some();
     let actuator: Arc<dyn SafetyActuator> = Arc::new(NvmlActuator::new(target));
     // Read-only startup query also detects a persistent brake in software-only mode.
     let startup_actuator = Arc::clone(&actuator);
@@ -234,6 +306,27 @@ pub async fn run(prepared: &mut SupervisorStart) -> Result<(), Box<dyn std::erro
             tracing::warn!(?err, "startup NVML power-limit query unavailable");
             (None, None)
         });
+    // Seed the health verdict here, where a cold `nvidia-smi` start has the long
+    // startup bound, so it cannot overrun the first tick and trip the brake.
+    // No resolved target means no driver to probe: skip it so a wedged
+    // `nvidia-smi` cannot add its timeout to startup for nothing. The probe is
+    // a subprocess, not an NVML call, so it does not take the gate — a wedged
+    // child holding the permit past this wait would starve every later read.
+    // Off the gate, the health watchdog abandons and retries it like any other
+    // probe that outlives its kill bound.
+    if !cli.force_software_only && has_target {
+        let probe_bridge = Arc::clone(&bridge);
+        match tokio::time::timeout(
+            NVML_TIMEOUT,
+            tokio::task::spawn_blocking(move || probe_bridge.probe_health()),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => tracing::warn!(?err, "startup GPU health probe panicked"),
+            Err(_) => tracing::warn!("startup GPU health probe timed out; watchdog will retry"),
+        }
+    }
     let policy = config.resolve(if cli.force_software_only {
         None
     } else {
@@ -290,11 +383,41 @@ pub async fn run(prepared: &mut SupervisorStart) -> Result<(), Box<dyn std::erro
     );
     supervisor.seed_startup_brake(current_w, default_w);
 
+    let shutdown_reason =
+        run_loop(&mut supervisor, Duration::from_millis(cli.step_interval_ms)).await?;
+
+    let _plan = supervisor
+        .shutdown(shutdown_reason, &metrics_shutdown_tx, metrics_task)
+        .await;
+    eprintln!("[relay] runtime stopping; process lock remains held through shutdown");
+
+    Ok(())
+}
+
+/// The supervisor's steady-state loop: step, then sleep only the remainder of
+/// the interval measured from the tick's start, so a slow tick starts the next
+/// step immediately instead of drifting a full extra interval late (an overrun
+/// is counted by `record_step_duration`, never slept off). Returns why it
+/// stopped.
+async fn run_loop(
+    supervisor: &mut Supervisor,
+    interval: Duration,
+) -> Result<ShutdownReason, Box<dyn std::error::Error>> {
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
-    let mut sigterm = signal(SignalKind::terminate())?;
+    // SIGTERM only exists on unix; elsewhere the wait pends forever and
+    // Ctrl-C remains the orderly stop.
+    #[cfg(unix)]
+    let sigterm_wait = {
+        let mut sigterm = signal(SignalKind::terminate())?;
+        async move { sigterm.recv().await }
+    };
+    #[cfg(not(unix))]
+    let sigterm_wait = std::future::pending::<Option<()>>();
+    tokio::pin!(sigterm_wait);
 
-    let shutdown_reason = loop {
+    Ok(loop {
+        let tick_started = Instant::now();
         let report = supervisor.step().await;
         tracing::debug!(
             step = report.step,
@@ -308,23 +431,17 @@ pub async fn run(prepared: &mut SupervisorStart) -> Result<(), Box<dyn std::erro
             "supervisor step"
         );
 
+        let pause = interval.saturating_sub(tick_started.elapsed());
         tokio::select! {
             _ = &mut ctrl_c => {
                 break ShutdownReason::Sigint;
             }
-            _ = sigterm.recv() => {
+            _ = &mut sigterm_wait => {
                 break ShutdownReason::Sigterm;
             }
-            _ = sleep(Duration::from_millis(cli.step_interval_ms)) => {}
+            _ = sleep(pause) => {}
         }
-    };
-
-    let _plan = supervisor
-        .shutdown(shutdown_reason, &metrics_shutdown_tx, metrics_task)
-        .await;
-    eprintln!("[relay] runtime stopping; process lock remains held through shutdown");
-
-    Ok(())
+    })
 }
 
 /// Perform an explicit, read-only validation of the same GPU adapters used by
@@ -543,12 +660,15 @@ fn run_gpu_hardware_actuation_smoke(
     // A running relay drives the same brake target; letting the smoke apply
     // and release beneath it could lift a real brake mid-fault. Held until
     // the smoke returns, including through cleanup.
-    check_legacy_lock(LEGACY_PROCESS_LOCK_PATH)
+    check_legacy_lock(&legacy_process_lock_path())
         .map_err(|msg| format!("{msg} Stop the supervisor before the actuation smoke."))?;
-    let _lock_guard = try_acquire_lock(PROCESS_LOCK_PATH).map_err(|msg| {
+    let _lock_guard = try_acquire_lock(&process_lock_path()).map_err(|msg| {
         format!("{msg} Stop the running vahtisiru supervisor before the actuation smoke.")
     })?;
-    println!("Process lock held: {PROCESS_LOCK_PATH} (no supervisor is running)");
+    println!(
+        "Process lock held: {} (no supervisor is running)",
+        process_lock_path()
+    );
     list_nvidia_devices()?;
 
     let target = GpuTarget::resolve()?;
@@ -909,85 +1029,91 @@ mod tests {
         assert!(!cli.force_software_only);
     }
 
+    /// Unique lock path inside the platform lock dir (`/tmp` on unix, the OS
+    /// temp dir elsewhere), so the lock tests run on every dev host.
+    fn test_lock_path(name: &str) -> String {
+        lock_dir().join(name).to_string_lossy().into_owned()
+    }
+
     #[test]
     fn lock_guard_created_and_removed() {
-        let lock_path = "/tmp/vahtisiru_test_created.lock";
-        let _ = std::fs::remove_file(lock_path);
-        let guard = try_acquire_lock(lock_path).unwrap();
-        assert!(std::path::Path::new(lock_path).exists());
+        let lock_path = test_lock_path("vahtisiru_test_created.lock");
+        let _ = std::fs::remove_file(&lock_path);
+        let guard = try_acquire_lock(&lock_path).unwrap();
+        assert!(std::path::Path::new(&lock_path).exists());
         drop(guard);
-        assert!(!std::path::Path::new(lock_path).exists());
+        assert!(!std::path::Path::new(&lock_path).exists());
     }
 
     #[test]
     fn lock_guard_rejects_active_pid() {
-        let lock_path = "/tmp/vahtisiru_test_active.lock";
-        let _ = std::fs::remove_file(lock_path);
-        std::fs::write(lock_path, std::process::id().to_string()).unwrap();
-        let err = try_acquire_lock(lock_path).unwrap_err();
+        let lock_path = test_lock_path("vahtisiru_test_active.lock");
+        let _ = std::fs::remove_file(&lock_path);
+        std::fs::write(&lock_path, std::process::id().to_string()).unwrap();
+        let err = try_acquire_lock(&lock_path).unwrap_err();
         assert!(
             err.contains("already active"),
             "expected active-instance error, got: {err}"
         );
-        let _ = std::fs::remove_file(lock_path);
+        let _ = std::fs::remove_file(&lock_path);
     }
 
     #[test]
     fn lock_guard_reclaims_stale_lock() {
-        let lock_path = "/tmp/vahtisiru_test_stale.lock";
-        let _ = std::fs::remove_file(lock_path);
-        std::fs::write(lock_path, "0").unwrap();
-        let guard = try_acquire_lock(lock_path).unwrap();
-        let content = std::fs::read_to_string(lock_path).unwrap();
+        let lock_path = test_lock_path("vahtisiru_test_stale.lock");
+        let _ = std::fs::remove_file(&lock_path);
+        std::fs::write(&lock_path, "0").unwrap();
+        let guard = try_acquire_lock(&lock_path).unwrap();
+        let content = std::fs::read_to_string(&lock_path).unwrap();
         assert_eq!(content.trim(), std::process::id().to_string());
         drop(guard);
-        assert!(!std::path::Path::new(lock_path).exists());
+        assert!(!std::path::Path::new(&lock_path).exists());
     }
 
     #[test]
     fn legacy_lock_rejects_active_pid_and_reclaims_stale() {
-        let lock_path = "/tmp/vahtisiru_test_legacy_active.lock";
-        let _ = std::fs::remove_file(lock_path);
-        std::fs::write(lock_path, std::process::id().to_string()).unwrap();
-        let err = check_legacy_lock(lock_path).unwrap_err();
+        let lock_path = test_lock_path("vahtisiru_test_legacy_active.lock");
+        let _ = std::fs::remove_file(&lock_path);
+        std::fs::write(&lock_path, std::process::id().to_string()).unwrap();
+        let err = check_legacy_lock(&lock_path).unwrap_err();
         assert!(
             err.contains("already active"),
             "expected active-instance error, got: {err}"
         );
-        let _ = std::fs::remove_file(lock_path);
+        let _ = std::fs::remove_file(&lock_path);
 
-        std::fs::write(lock_path, "0").unwrap();
-        check_legacy_lock(lock_path).unwrap();
-        assert!(!std::path::Path::new(lock_path).exists());
+        std::fs::write(&lock_path, "0").unwrap();
+        check_legacy_lock(&lock_path).unwrap();
+        assert!(!std::path::Path::new(&lock_path).exists());
     }
 
     #[test]
     fn prepared_process_lock_outlives_supervisor_future_and_runtime() {
-        let path = "/tmp/vahtisiru_test_prepared_runtime.lock";
-        let _ = std::fs::remove_file(path);
+        let path = test_lock_path("vahtisiru_test_prepared_runtime.lock");
+        let _ = std::fs::remove_file(&path);
         let cli = Cli::parse_from(["vahtisiru"]);
         let prepared = SupervisorStart {
             config: cli.safety_policy_config(),
             cli,
-            _lock_guard: try_acquire_lock(path).unwrap(),
+            _lock_guard: try_acquire_lock(&path).unwrap(),
         };
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let _ = &prepared;
         });
-        assert!(try_acquire_lock(path).is_err());
+        assert!(try_acquire_lock(&path).is_err());
         runtime.shutdown_timeout(Duration::from_millis(10));
-        assert!(try_acquire_lock(path).is_err());
+        assert!(try_acquire_lock(&path).is_err());
         drop(prepared);
-        assert!(!std::path::Path::new(path).exists());
+        assert!(!std::path::Path::new(&path).exists());
     }
 
     #[tokio::test]
     async fn orderly_shutdown_then_lock_guard_releases_file() {
-        let lock_path = "/tmp/vahtisiru_test_shutdown.lock";
-        let _ = std::fs::remove_file(lock_path);
-        let guard = try_acquire_lock(lock_path).unwrap();
-        assert!(std::path::Path::new(lock_path).exists());
+        let lock_path = test_lock_path("vahtisiru_test_shutdown.lock");
+        let _ = std::fs::remove_file(&lock_path);
+        let guard = try_acquire_lock(&lock_path).unwrap();
+        assert!(std::path::Path::new(&lock_path).exists());
 
         // Production adapters with no GPU target: NvmlActuator refuses to
         // mutate and HardwareBridge fail-closes. Nothing here touches hardware.
@@ -997,7 +1123,7 @@ mod tests {
                 force_software_only: true,
                 cadence_ms: 100,
                 eval_interval_ms: SAFETY_EVAL_CADENCE_MS,
-                nvml_timeout: NVML_TIMEOUT,
+                acquire_deadline: ACQUIRE_DEADLINE,
                 dashboard: false,
             },
             SupervisorParts {
@@ -1017,8 +1143,8 @@ mod tests {
         let _ = supervisor
             .shutdown(ShutdownReason::Sigint, &tx, metrics_task)
             .await;
-        assert!(std::path::Path::new(lock_path).exists());
+        assert!(std::path::Path::new(&lock_path).exists());
         drop(guard);
-        assert!(!std::path::Path::new(lock_path).exists());
+        assert!(!std::path::Path::new(&lock_path).exists());
     }
 }

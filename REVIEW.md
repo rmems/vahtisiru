@@ -48,7 +48,7 @@ cargo test lock_guard         # single-instance lockfile tests
 | lib.rs | `inventory_classifies_every_gpu_signal` | Signal class/unit/range inventory |
 | lib.rs | `test_raw_software_fallback_never_uses_silent_zero_for_missing_vram` | VRAM stays missing in fallback |
 | lib.rs | `test_read_telemetry_force_software_only` | Forced software-only telemetry read |
-| lib.rs | `test_is_gpu_healthy_does_not_panic` | GPU health check no-panic |
+| lib.rs | `test_probe_health_does_not_panic` | GPU health probe no-panic |
 | lib.rs | `test_safety_ok_on_simulated_values` | Simulated telemetry skips safety |
 | lib.rs | `test_safety_does_not_infer_simulation_from_old_magic_values` | No magic-value sim inference |
 | lib.rs | `test_safety_warn_on_elevated_temp` | 75-85°C warning threshold |
@@ -146,6 +146,7 @@ locks the remaining edges and adds an integration harness under `tests/`.
   with the actuator, publisher, telemetry acquirer, and clock injected (RM-1459).
   `cargo test --lib supervisor` runs the fault table in-process without a GPU,
   `sudo`, or `nvidia-smi`: hung NVML acquire (tick and post-actuation re-read),
+  a SIGTERM-ignoring fake `nvidia-smi` at the production deadline (RM-1475),
   `sudo -n` denied on apply, release failure, apply in flight while telemetry
   turns healthy (no overlapping release), panicking actuator worker, slow
   sensory consumer, and `--force-software-only` with a leftover real brake.
@@ -156,7 +157,7 @@ locks the remaining edges and adds an integration harness under `tests/`.
 
 ### Gaps closed (at the time, since partly superseded by RM-1143's UDP/SNN removal above)
 
-- Software-only GPU telemetry fallback (`HardwareBridge::read_telemetry_force(true)`, `TelemetryFrame::to_sensory_mapping`, `is_gpu_healthy` no-panic).
+- Software-only GPU telemetry fallback (`HardwareBridge::read_telemetry_force(true)`, `TelemetryFrame::to_sensory_mapping`, `probe_health` no-panic).
 - Single-instance lockfile lifecycle (`try_acquire_lock`, active PID rejection, stale lock reclamation, create/remove behavior).
 
 ### Gaps explicitly deferred

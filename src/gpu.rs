@@ -32,10 +32,27 @@ use crate::telemetry::{SampleClock, TelemetryFrame, assess_with_clock};
 use lazy_static::lazy_static;
 use nvml_wrapper::Nvml;
 use nvml_wrapper::enum_wrappers::device::{Clock, TemperatureSensor};
+use std::ffi::{OsStr, OsString};
+use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 lazy_static! {
     static ref NVML: Option<Nvml> = Nvml::init().ok();
 }
+
+/// Re-probe spacing while the last `nvidia-smi -L` verdict was healthy.
+const HEALTH_PROBE_INTERVAL: Duration = Duration::from_secs(30);
+/// Re-probe spacing after a failed verdict: the relay stays fail-closed for up
+/// to this long after the driver recovers, and a wedged driver accumulates at
+/// most one unkillable (uninterruptible) `nvidia-smi` per interval.
+const HEALTH_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+/// Longest a probe may stay in flight before it is abandoned. `timeout -k`
+/// exits within ~2 s for any killable child, so an older probe is a child in
+/// uninterruptible sleep: its slot is freed and the verdict failed closed so
+/// a stale "healthy" cannot be served forever, while the straggler still
+/// records its verdict whenever it eventually returns.
+const PROBE_ABANDON_AFTER: Duration = Duration::from_secs(10);
 
 // ── GPU identity (GH#70 / RM-1850) ──────────────────────────────────
 
@@ -154,6 +171,181 @@ pub(crate) fn is_valid_gpu_uuid(uuid: &str) -> bool {
     parts.next().is_none()
 }
 
+// ── Driver health probe (RM-1475) ───────────────────────────────────
+
+/// Arguments for the `nvidia-smi -L` probe: SIGTERM at 1 s, SIGKILL 1 s later,
+/// so a child that ignores SIGTERM cannot outlive 2 s.
+fn health_probe_args(program: &OsStr) -> Vec<OsString> {
+    let mut args: Vec<OsString> = ["-k", "1s", "1s"].iter().map(OsString::from).collect();
+    args.push(program.to_os_string());
+    args.push(OsString::from("-L"));
+    args
+}
+
+/// Run one probe. Output is discarded rather than piped so a descendant holding
+/// a pipe open cannot extend the wait past the `timeout` exit.
+fn run_health_probe(program: &OsStr) -> bool {
+    std::process::Command::new("timeout")
+        .args(health_probe_args(program))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[derive(Debug, Default)]
+struct HealthState {
+    /// Last finished verdict; `None` until the first probe completes.
+    healthy: Option<bool>,
+    last_started: Option<Instant>,
+    in_flight: bool,
+    /// Bumped on every probe launch. A result carrying an older generation is
+    /// from an abandoned probe and must not overwrite the replacement's state.
+    generation: u64,
+}
+
+/// What an acquisition does about the probe at this instant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbePlan {
+    /// No verdict yet: nothing to answer with, so probe on this call.
+    Inline,
+    /// Answer from the cached verdict and refresh it off the acquisition path.
+    Background,
+    UseCached,
+}
+
+/// Pure probe scheduling; at most one probe runs at a time.
+fn plan_health_probe(state: &HealthState, now: Instant) -> ProbePlan {
+    if state.in_flight {
+        return ProbePlan::UseCached;
+    }
+    let Some(healthy) = state.healthy else {
+        return ProbePlan::Inline;
+    };
+    let interval = if healthy {
+        HEALTH_PROBE_INTERVAL
+    } else {
+        HEALTH_RETRY_INTERVAL
+    };
+    let due = state
+        .last_started
+        .is_none_or(|started| now.saturating_duration_since(started) >= interval);
+    if due {
+        ProbePlan::Background
+    } else {
+        ProbePlan::UseCached
+    }
+}
+
+/// Rate-limited driver health verdict.
+///
+/// Re-probes run on a detached thread rather than the acquisition worker, so a
+/// slow-but-obedient `nvidia-smi` costs telemetry nothing and a wedged one
+/// cannot consume the acquisition deadline. A detached thread also cannot hold
+/// up runtime shutdown. A hung NVML call is not this type's job: the supervisor
+/// bounds those directly with its acquisition deadline.
+#[derive(Debug)]
+struct GpuHealth {
+    program: OsString,
+    state: Mutex<HealthState>,
+}
+
+impl GpuHealth {
+    fn new(program: impl Into<OsString>) -> Self {
+        Self {
+            program: program.into(),
+            state: Mutex::new(HealthState::default()),
+        }
+    }
+
+    /// Current verdict; schedules a probe if one is due. No verdict is unhealthy.
+    fn check(self: &Arc<Self>, now: Instant) -> bool {
+        let (plan, generation, cached) = {
+            let mut state = self.state.lock().unwrap();
+            // A probe that outlived its kill bound is wedged: fail closed and
+            // free the slot so a retry can run, rather than serving the stale
+            // verdict while the straggler sits in uninterruptible sleep.
+            if state.in_flight
+                && state.last_started.is_some_and(|started| {
+                    now.saturating_duration_since(started) >= PROBE_ABANDON_AFTER
+                })
+            {
+                state.in_flight = false;
+                state.healthy = Some(false);
+            }
+            let plan = plan_health_probe(&state, now);
+            let mut generation = state.generation;
+            if plan != ProbePlan::UseCached {
+                state.in_flight = true;
+                state.last_started = Some(now);
+                state.generation += 1;
+                generation = state.generation;
+            }
+            (plan, generation, state.healthy.unwrap_or(false))
+        };
+        match plan {
+            ProbePlan::Inline => self.run_and_record(generation),
+            ProbePlan::Background => {
+                self.spawn_probe(generation);
+                cached
+            }
+            ProbePlan::UseCached => cached,
+        }
+    }
+
+    fn spawn_probe(self: &Arc<Self>, generation: u64) {
+        let health = Arc::clone(self);
+        let spawned = std::thread::Builder::new()
+            .name("gpu-health-probe".into())
+            .spawn(move || {
+                health.run_and_record(generation);
+            });
+        if spawned.is_err() {
+            self.record(generation, false);
+        }
+    }
+
+    fn probe_now(&self) -> bool {
+        let generation = {
+            let mut state = self.state.lock().unwrap();
+            state.in_flight = true;
+            state.last_started = Some(Instant::now());
+            state.generation += 1;
+            state.generation
+        };
+        self.run_and_record(generation)
+    }
+
+    fn run_and_record(&self, generation: u64) -> bool {
+        let healthy = run_health_probe(&self.program);
+        self.record(generation, healthy);
+        healthy
+    }
+
+    fn record(&self, generation: u64, healthy: bool) {
+        let previous = {
+            let mut state = self.state.lock().unwrap();
+            // A newer probe has already launched: this result is from an
+            // abandoned straggler, so it must not clobber the replacement's
+            // in-flight flag or verdict.
+            if generation != state.generation {
+                return;
+            }
+            state.in_flight = false;
+            state.healthy.replace(healthy)
+        };
+        // Log transitions only: the verdict is read on every telemetry tick.
+        if !healthy && previous != Some(false) {
+            println!(
+                "[hardware_bridge] nvidia-smi hung or health probe failed. Treating telemetry as unavailable (fail closed)."
+            );
+        } else if healthy && previous == Some(false) {
+            println!("[hardware_bridge] nvidia-smi health probe recovered.");
+        }
+    }
+}
+
 // ── Hardware Bridge ─────────────────────────────────────────────────
 
 /// GPU telemetry acquisition facade (NVML + software-fallback / unavailable).
@@ -170,6 +362,7 @@ pub(crate) fn is_valid_gpu_uuid(uuid: &str) -> bool {
 #[derive(Debug, Clone)]
 pub struct HardwareBridge {
     target: Option<GpuTarget>,
+    health: Arc<GpuHealth>,
 }
 
 impl HardwareBridge {
@@ -181,7 +374,23 @@ impl HardwareBridge {
     /// documented idle estimates).
     #[must_use]
     pub fn new(target: Option<GpuTarget>) -> Self {
-        Self { target }
+        Self {
+            target,
+            health: Arc::new(GpuHealth::new("nvidia-smi")),
+        }
+    }
+
+    /// Bridge whose health probe runs `program` instead of `nvidia-smi`, so a
+    /// fake binary can stand in without mutating the process `PATH`.
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_health_program_for_test(
+        target: Option<GpuTarget>,
+        program: impl Into<OsString>,
+    ) -> Self {
+        Self {
+            target,
+            health: Arc::new(GpuHealth::new(program)),
+        }
     }
 
     /// Read telemetry, but if `force_software` is true, always use the simulated
@@ -221,40 +430,24 @@ impl HardwareBridge {
         }
         self.target
             .as_ref()
+            .filter(|_| self.health.check(Instant::now()))
             .and_then(Self::read_nvml)
             .unwrap_or_else(|| RawTelemetry::nvml_unavailable(unix_now_ms()))
     }
 
-    /// Returns true if the NVIDIA driver is responsive and the GPU is healthy.
-    /// Uses a tight timeout to prevent blocking the supervisor if the driver is "wedged".
-    pub fn is_gpu_healthy() -> bool {
-        let output = std::process::Command::new("timeout")
-            .args(["-k", "1s", "1s", "nvidia-smi", "-L"])
-            .output();
-
-        match output {
-            Ok(out) => out.status.success(),
-            Err(_) => false,
-        }
+    /// Run the driver health probe now and cache its verdict, so the first
+    /// supervisor tick is not the one paying for a cold `nvidia-smi` start.
+    /// Blocks until the probe child exits. The probe is a subprocess, not an
+    /// NVML call — do **not** run it under the NVML gate: a wedged child
+    /// holding the permit past the caller's timeout would starve every later
+    /// acquisition before the health watchdog could abandon it. A child stuck
+    /// in uninterruptible sleep can also outlast its own kill bound, so bound
+    /// the wait at the call site.
+    pub fn probe_health(&self) -> bool {
+        self.health.probe_now()
     }
 
     fn read_nvml(target: &GpuTarget) -> Option<RawTelemetry> {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        // Only log on the healthy -> unhealthy transition; the telemetry loop
-        // calls this ~10x/sec, so an unconditional print would flood stdout
-        // while the driver stays wedged.
-        static WAS_UNHEALTHY: AtomicBool = AtomicBool::new(false);
-
-        if !Self::is_gpu_healthy() {
-            if !WAS_UNHEALTHY.swap(true, Ordering::Relaxed) {
-                println!(
-                    "[hardware_bridge] nvidia-smi hung. Treating telemetry as unavailable (fail closed)."
-                );
-            }
-            return None;
-        }
-        WAS_UNHEALTHY.store(false, Ordering::Relaxed);
-
         let nvml = NVML.as_ref()?;
         // Address the device by its validated UUID, not by index, so telemetry
         // stays bound to the GPU chosen at startup even if enumeration shifts.
@@ -759,9 +952,10 @@ mod tests {
     }
 
     #[test]
-    fn test_is_gpu_healthy_does_not_panic() {
-        let result = std::panic::catch_unwind(HardwareBridge::is_gpu_healthy);
-        assert!(result.is_ok(), "is_gpu_healthy should not panic");
+    fn test_probe_health_does_not_panic() {
+        let bridge = test_bridge();
+        let result = std::panic::catch_unwind(|| bridge.probe_health());
+        assert!(result.is_ok(), "probe_health should not panic");
     }
 
     /// Without a real GPU (no NVML), actuation must fail closed with a typed
@@ -853,6 +1047,305 @@ mod tests {
             frame.source,
             TelemetrySource::Nvml | TelemetrySource::NvmlUnavailable
         ));
+    }
+}
+
+/// Fake `nvidia-smi` executables for driving the real probe without a GPU.
+/// Shell-script fakes and GNU `timeout` only exist on unix.
+#[cfg(all(test, unix))]
+pub(crate) mod fake_nvidia_smi {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// Ignores SIGTERM (children inherit that) and outlives every deadline.
+    pub(crate) const IGNORES_SIGTERM: &str = "trap '' TERM\nsleep 30\n";
+
+    /// A shell script in its own temp directory that counts its executions.
+    pub(crate) struct FakeBinary {
+        dir: PathBuf,
+    }
+
+    impl FakeBinary {
+        pub(crate) fn install(body: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            static NEXT: AtomicU32 = AtomicU32::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "vahtisiru-fake-nvidia-smi-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let fake = Self { dir };
+            let script = format!(
+                "#!/bin/sh\n[ \"$1\" = --ready ] && exit 0\necho x >> '{}'\n{body}",
+                fake.calls_path().display()
+            );
+            std::fs::write(fake.path(), script).unwrap();
+            std::fs::set_permissions(fake.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+            fake.wait_until_executable();
+            fake
+        }
+
+        /// A sibling test's fork can briefly inherit our write handle, which
+        /// makes exec fail with ETXTBSY. One success means no writer remains.
+        fn wait_until_executable(&self) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !std::process::Command::new(self.path())
+                .arg("--ready")
+                .status()
+                .is_ok_and(|status| status.success())
+            {
+                assert!(Instant::now() < deadline, "fake binary never became ready");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        pub(crate) fn path(&self) -> PathBuf {
+            self.dir.join("nvidia-smi")
+        }
+
+        fn calls_path(&self) -> PathBuf {
+            self.dir.join("calls")
+        }
+
+        /// Times the script body has started.
+        pub(crate) fn calls(&self) -> usize {
+            read_lines(&self.calls_path())
+        }
+    }
+
+    fn read_lines(path: &Path) -> usize {
+        std::fs::read_to_string(path).map_or(0, |text| text.lines().count())
+    }
+
+    impl Drop for FakeBinary {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
+#[cfg(test)]
+mod health_probe_tests {
+    #[cfg(unix)]
+    use super::fake_nvidia_smi::{FakeBinary, IGNORES_SIGTERM};
+    use super::*;
+
+    #[cfg(unix)]
+    const UUID: &str = "GPU-12345678-1234-1234-1234-123456789abc";
+
+    #[cfg(unix)]
+    fn bridge_running(fake: &FakeBinary) -> HardwareBridge {
+        HardwareBridge::with_health_program_for_test(
+            Some(GpuTarget::from_uuid_for_test(UUID)),
+            fake.path(),
+        )
+    }
+
+    fn state(healthy: Option<bool>, age: Duration, now: Instant) -> HealthState {
+        HealthState {
+            healthy,
+            last_started: Some(now - age),
+            in_flight: false,
+            generation: 0,
+        }
+    }
+
+    #[test]
+    fn stale_probe_result_cannot_overwrite_the_replacement() {
+        let health = GpuHealth::new("nvidia-smi");
+        {
+            let mut state = health.state.lock().unwrap();
+            // A probe was abandoned and a replacement launched (generation 2).
+            state.healthy = Some(false);
+            state.in_flight = true;
+            state.generation = 2;
+        }
+        // The abandoned probe's late "healthy" arrives: it must not clear the
+        // replacement's in-flight flag nor flip the fail-closed verdict.
+        health.record(1, true);
+        let state = health.state.lock().unwrap();
+        assert!(state.in_flight);
+        assert_eq!(state.healthy, Some(false));
+    }
+
+    #[cfg(unix)]
+    fn wait_for_verdict(health: &GpuHealth) -> Option<bool> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            {
+                let state = health.state.lock().unwrap();
+                if !state.in_flight {
+                    return state.healthy;
+                }
+            }
+            assert!(Instant::now() < deadline, "probe never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn probe_args_escalate_to_sigkill() {
+        assert_eq!(
+            health_probe_args(OsStr::new("nvidia-smi")),
+            ["-k", "1s", "1s", "nvidia-smi", "-L"].map(OsString::from)
+        );
+    }
+
+    #[test]
+    fn plan_probes_first_then_only_when_the_interval_elapses() {
+        let now = Instant::now() + Duration::from_secs(120);
+        assert_eq!(
+            plan_health_probe(&HealthState::default(), now),
+            ProbePlan::Inline
+        );
+        let cases = [
+            (true, Duration::from_millis(100), ProbePlan::UseCached),
+            (true, HEALTH_RETRY_INTERVAL, ProbePlan::UseCached),
+            (true, HEALTH_PROBE_INTERVAL, ProbePlan::Background),
+            (false, Duration::from_millis(100), ProbePlan::UseCached),
+            (false, HEALTH_RETRY_INTERVAL, ProbePlan::Background),
+        ];
+        for (healthy, age, expected) in cases {
+            assert_eq!(
+                plan_health_probe(&state(Some(healthy), age, now), now),
+                expected,
+                "healthy={healthy} age={age:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_never_overlaps_a_running_probe() {
+        let now = Instant::now() + Duration::from_secs(120);
+        for healthy in [None, Some(true), Some(false)] {
+            let mut running = state(healthy, HEALTH_PROBE_INTERVAL, now);
+            running.in_flight = true;
+            assert_eq!(plan_health_probe(&running, now), ProbePlan::UseCached);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_past_its_kill_bound_is_abandoned_and_fails_closed() {
+        let fake = FakeBinary::install("exit 0\n");
+        let health = Arc::new(GpuHealth::new(fake.path()));
+        {
+            let mut state = health.state.lock().unwrap();
+            // A stale "healthy" verdict with a probe that outlived its kill
+            // bound — the child is wedged in uninterruptible sleep.
+            state.healthy = Some(true);
+            state.in_flight = true;
+            state.last_started =
+                Some(Instant::now() - PROBE_ABANDON_AFTER - Duration::from_secs(1));
+        }
+        // The stale verdict is not served: the call fails closed and launches
+        // a replacement (generation bumped) so a retry can find the driver.
+        assert!(!health.check(Instant::now()));
+        assert_eq!(health.state.lock().unwrap().generation, 1);
+        // The replacement probe is a fast success: the verdict recovers.
+        assert_eq!(wait_for_verdict(&health), Some(true));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sigterm_ignoring_binary_is_killed_and_reported_unhealthy() {
+        let fake = FakeBinary::install(IGNORES_SIGTERM);
+        let started = Instant::now();
+        let healthy = run_health_probe(fake.path().as_os_str());
+        let elapsed = started.elapsed();
+        assert!(!healthy);
+        // Past the SIGTERM (so the child really ignored it), and well short of
+        // the 30 s sleep (so SIGKILL really ended it).
+        assert!(elapsed >= Duration::from_secs(1), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn healthy_path_does_not_exec_at_the_acquisition_cadence() {
+        let fake = FakeBinary::install("exit 0\n");
+        let bridge = bridge_running(&fake);
+        for _ in 0..50 {
+            bridge.acquire_raw(false);
+        }
+        assert_eq!(fake.calls(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_probe_fails_closed_and_retries_are_rate_limited() {
+        let fake = FakeBinary::install("exit 1\n");
+        let bridge = bridge_running(&fake);
+        for _ in 0..50 {
+            assert_eq!(
+                bridge.acquire_raw(false).source,
+                TelemetrySource::NvmlUnavailable
+            );
+        }
+        assert_eq!(fake.calls(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forced_software_and_absent_target_never_exec_the_probe() {
+        let fake = FakeBinary::install("exit 0\n");
+        let simulated = bridge_running(&fake);
+        let no_target = HardwareBridge::with_health_program_for_test(None, fake.path());
+        for _ in 0..10 {
+            assert_eq!(
+                simulated.acquire_raw(true).source,
+                TelemetrySource::SoftwareFallback
+            );
+            assert_eq!(
+                no_target.acquire_raw(false).source,
+                TelemetrySource::NvmlUnavailable
+            );
+        }
+        assert_eq!(fake.calls(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slow_obedient_probe_stays_healthy() {
+        let fake = FakeBinary::install("sleep 0.5\n");
+        assert!(run_health_probe(fake.path().as_os_str()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn due_reprobe_answers_from_cache_without_waiting_for_a_hung_binary() {
+        let fake = FakeBinary::install(IGNORES_SIGTERM);
+        let health = Arc::new(GpuHealth::new(fake.path()));
+        {
+            let mut state = health.state.lock().unwrap();
+            state.healthy = Some(true);
+            state.last_started = Some(Instant::now());
+        }
+        let started = Instant::now();
+        let later = started + HEALTH_PROBE_INTERVAL;
+        assert!(health.check(later), "due re-probe answers from cache");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(wait_for_verdict(&health), Some(false));
+        // The hung binary was killed, and its verdict now gates acquisition.
+        assert!(!health.check(later));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn background_reprobe_restores_a_failed_verdict() {
+        let fake = FakeBinary::install("exit 0\n");
+        let health = Arc::new(GpuHealth::new(fake.path()));
+        {
+            let mut state = health.state.lock().unwrap();
+            state.healthy = Some(false);
+            state.last_started = Some(Instant::now());
+        }
+        let later = Instant::now() + HEALTH_RETRY_INTERVAL;
+        assert!(!health.check(later), "still fail-closed until it finishes");
+        assert_eq!(wait_for_verdict(&health), Some(true));
+        assert!(health.check(later));
     }
 }
 

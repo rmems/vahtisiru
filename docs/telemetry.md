@@ -69,15 +69,19 @@ Simulated data is [`TelemetrySource::SoftwareFallback`] and is used only for
 that happens to read `0 °C` and `25 W` is still `source = Nvml` and may be a
 legitimate idle GPU.
 
-The supervisor takes its process lock before startup NVML queries. Startup,
-per-tick, and post-actuation NVML reads have a two-second wait limit. One
-shared gate admits only one blocking NVML operation at a time, including
+The supervisor takes its process lock before startup NVML queries. Startup
+reads have a two-second wait limit; per-tick and post-actuation reads share a
+900 ms budget per step, so a wedged driver is evaluated fail-closed within 1 s.
+One shared gate admits only one blocking NVML operation at a time, including
 power-limit actuation queries. A timed-out driver call may remain blocked in
 its worker because NVML does not provide safe cancellation; the gate stays
 occupied until that call returns. Later real reads report `NvmlUnavailable`
 without launching more blocked workers. An unavailable tick is evaluated by
 the safety machine immediately. Forced software-only telemetry keeps its
-explicit `SoftwareFallback` provenance.
+explicit `SoftwareFallback` provenance and never runs the probe below.
+
+Driver health (`timeout -k 1s 1s nvidia-smi -L`) is a cached verdict, not a
+per-tick command: see [the safety contract](safety.md) for its cadence.
 
 ## Pipeline
 
