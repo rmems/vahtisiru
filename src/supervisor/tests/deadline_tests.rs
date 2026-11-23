@@ -142,15 +142,16 @@ async fn spent_tick_budget_fails_closed_without_starting_a_worker() {
 // second must fail closed on the shared deadline, not a fresh one.
 #[tokio::test]
 async fn post_actuation_read_inherits_the_spent_step_budget() {
-    // 150 ms deadline, 100 ms per read: the first fits with ~50 ms of
-    // scheduling slack, the second inherits only the ~50 ms remainder and
-    // cannot fit its own 100 ms — wide margins against slow CI runners.
+    // 450 ms deadline, 300 ms per read: the first fits with ~150 ms of
+    // scheduling slack, and the second inherits only the ~150 ms remainder —
+    // far short of its own 300 ms — so it fails closed on the shared budget.
+    // Both margins stay wide even on loaded CI runners.
     let acquirer = Arc::new(
         ScriptedAcquirer::new([fixtures::healthy_real(), fixtures::healthy_real()])
-            .with_delay(Duration::from_millis(100)),
+            .with_delay(Duration::from_millis(300)),
     );
     let mut sup = harness().acquirer(acquirer.clone()).build();
-    sup.tick_deadline = Some(Instant::now() + Duration::from_millis(150));
+    sup.tick_deadline = Some(Instant::now() + Duration::from_millis(450));
 
     let first = sup.acquire_raw_with_timeout().await;
     let second = sup.acquire_raw_with_timeout().await;
