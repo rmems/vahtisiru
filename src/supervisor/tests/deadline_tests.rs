@@ -137,6 +137,26 @@ async fn spent_tick_budget_fails_closed_without_starting_a_worker() {
     assert_eq!(exceeded, 1);
 }
 
+// A second read starts with whatever the first left of the step budget: two
+// delayed reads that each fit the deadline alone cannot both succeed — the
+// second must fail closed on the shared deadline, not a fresh one.
+#[tokio::test]
+async fn post_actuation_read_inherits_the_spent_step_budget() {
+    let acquirer = Arc::new(
+        ScriptedAcquirer::new([fixtures::healthy_real(), fixtures::healthy_real()])
+            .with_delay(Duration::from_millis(60)),
+    );
+    let mut sup = harness().acquirer(acquirer.clone()).build();
+    sup.tick_deadline = Some(Instant::now() + Duration::from_millis(100));
+
+    let first = sup.acquire_raw_with_timeout().await;
+    let second = sup.acquire_raw_with_timeout().await;
+
+    assert_eq!(first.source, TelemetrySource::Nvml);
+    assert_eq!(second.source, TelemetrySource::NvmlUnavailable);
+    assert_eq!(acquirer.calls(), 2);
+}
+
 #[tokio::test]
 async fn step_longer_than_its_period_counts_one_overrun() {
     let acquirer = Arc::new(ScriptedAcquirer::new([fixtures::healthy_real()]));

@@ -437,10 +437,12 @@ impl HardwareBridge {
 
     /// Run the driver health probe now and cache its verdict, so the first
     /// supervisor tick is not the one paying for a cold `nvidia-smi` start.
-    /// Blocks for up to the probe's kill bound. The probe is a subprocess, not
-    /// an NVML call — do **not** run it under the NVML gate: a wedged child
+    /// Blocks until the probe child exits. The probe is a subprocess, not an
+    /// NVML call — do **not** run it under the NVML gate: a wedged child
     /// holding the permit past the caller's timeout would starve every later
-    /// acquisition before the health watchdog could abandon it.
+    /// acquisition before the health watchdog could abandon it. A child stuck
+    /// in uninterruptible sleep can also outlast its own kill bound, so bound
+    /// the wait at the call site.
     pub fn probe_health(&self) -> bool {
         self.health.probe_now()
     }
