@@ -235,8 +235,8 @@ impl Supervisor {
     /// gate-bounded telemetry read and joining a worker that has already
     /// finished. Sleeping between ticks is the caller's job.
     pub(crate) async fn step(&mut self) -> StepReport {
-        let started = (self.deadline_clock)();
-        self.tick_deadline = Some(started + self.config.acquire_deadline);
+        let started = Instant::now();
+        self.tick_deadline = Some((self.deadline_clock)() + self.config.acquire_deadline);
         self.step_count += 1;
         let step_count = self.step_count;
         let mut dispatched = false;
