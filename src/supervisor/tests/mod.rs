@@ -269,6 +269,7 @@ impl Harness {
                     let ms = Arc::new(AtomicU64::new(0));
                     Arc::new(move || ms.fetch_add(100, Ordering::SeqCst))
                 },
+                deadline_clock: Arc::new(Instant::now),
                 relay_metrics: Arc::new(Mutex::new(RelayMetrics::default())),
             },
         )

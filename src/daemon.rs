@@ -378,6 +378,7 @@ pub async fn run(prepared: &mut SupervisorStart) -> Result<(), Box<dyn std::erro
             gate: nvml_gate,
             clock: Arc::new(unix_now_ms),
             monotonic: monotonic_ms_clock(),
+            deadline_clock: Arc::new(Instant::now),
             relay_metrics,
         },
     );
@@ -1135,6 +1136,7 @@ mod tests {
                 gate: NvmlGate::default(),
                 clock: Arc::new(unix_now_ms),
                 monotonic: monotonic_ms_clock(),
+                deadline_clock: Arc::new(Instant::now),
                 relay_metrics: Arc::clone(&relay_metrics),
             },
         );

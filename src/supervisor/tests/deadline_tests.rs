@@ -142,18 +142,29 @@ async fn spent_tick_budget_fails_closed_without_starting_a_worker() {
 // second must fail closed on the shared deadline, not a fresh one.
 #[tokio::test]
 async fn post_actuation_read_inherits_the_spent_step_budget() {
-    // 450 ms deadline, 300 ms per read: the first fits with ~150 ms of
-    // scheduling slack, and the second inherits only the ~150 ms remainder —
-    // far short of its own 300 ms — so it fails closed on the shared budget.
-    // Both margins stay wide even on loaded CI runners.
+    // An injected deadline clock makes the shared-budget arithmetic exact:
+    // 1 s deadline, 300 ms worker delay. The first read gets the full 1 s
+    // budget (700 ms of slack, not the old ~150 ms), and the test then
+    // advances the clock so the second read inherits only the last 50 ms —
+    // far short of its own 300 ms — and times out on the shared deadline.
+    let base = Instant::now();
+    let spent_ms = Arc::new(AtomicU64::new(0));
+    let deadline_clock = {
+        let spent_ms = Arc::clone(&spent_ms);
+        move || base + Duration::from_millis(spent_ms.load(Ordering::SeqCst))
+    };
     let acquirer = Arc::new(
         ScriptedAcquirer::new([fixtures::healthy_real(), fixtures::healthy_real()])
             .with_delay(Duration::from_millis(300)),
     );
     let mut sup = harness().acquirer(acquirer.clone()).build();
-    sup.tick_deadline = Some(Instant::now() + Duration::from_millis(450));
+    sup.deadline_clock = Arc::new(deadline_clock);
+    sup.tick_deadline = Some(base + Duration::from_secs(1));
 
     let first = sup.acquire_raw_with_timeout().await;
+    // As if the first read plus scheduling spent 950 ms of the step: the
+    // second inherits only the 50 ms remainder, not a fresh deadline.
+    spent_ms.store(950, Ordering::SeqCst);
     let second = sup.acquire_raw_with_timeout().await;
 
     assert_eq!(first.source, TelemetrySource::Nvml);

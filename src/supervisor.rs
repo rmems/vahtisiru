@@ -69,6 +69,10 @@ pub(crate) fn monotonic_ms_clock() -> MonotonicClock {
     Arc::new(move || u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX))
 }
 
+/// Instant source for the shared per-step acquisition deadline (injectable in
+/// tests; production is `Instant::now`, so the budget is real elapsed time).
+pub(crate) type DeadlineClock = Arc<dyn Fn() -> Instant + Send + Sync>;
+
 /// Static supervisor settings derived from the CLI.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SupervisorConfig {
@@ -93,6 +97,7 @@ pub(crate) struct SupervisorParts {
     pub gate: NvmlGate,
     pub clock: Clock,
     pub monotonic: MonotonicClock,
+    pub deadline_clock: DeadlineClock,
     pub relay_metrics: Arc<Mutex<RelayMetrics>>,
 }
 
@@ -130,6 +135,7 @@ pub(crate) struct Supervisor {
     gate: NvmlGate,
     clock: Clock,
     monotonic: MonotonicClock,
+    deadline_clock: DeadlineClock,
     relay_metrics: Arc<Mutex<RelayMetrics>>,
     warned_brake_held_sim: bool,
     warned_nvml_busy: bool,
@@ -157,6 +163,7 @@ impl Supervisor {
             gate: parts.gate,
             clock: parts.clock,
             monotonic: parts.monotonic,
+            deadline_clock: parts.deadline_clock,
             relay_metrics: parts.relay_metrics,
             warned_brake_held_sim: false,
             warned_nvml_busy: false,
@@ -226,7 +233,7 @@ impl Supervisor {
     /// gate-bounded telemetry read and joining a worker that has already
     /// finished. Sleeping between ticks is the caller's job.
     pub(crate) async fn step(&mut self) -> StepReport {
-        let started = Instant::now();
+        let started = (self.deadline_clock)();
         self.tick_deadline = Some(started + self.config.acquire_deadline);
         self.step_count += 1;
         let step_count = self.step_count;
@@ -412,7 +419,7 @@ impl Supervisor {
         let budget = self
             .tick_deadline
             .map_or(self.config.acquire_deadline, |end| {
-                end.saturating_duration_since(Instant::now())
+                end.saturating_duration_since((self.deadline_clock)())
             });
         let result = if budget.is_zero() {
             Err(NvmlRunError::TimedOut)
