@@ -137,27 +137,45 @@ async fn spent_tick_budget_fails_closed_without_starting_a_worker() {
     assert_eq!(exceeded, 1);
 }
 
-// A second read starts with whatever the first left of the step budget: two
-// delayed reads that each fit the deadline alone cannot both succeed — the
-// second must fail closed on the shared deadline, not a fresh one.
+// A second read starts with whatever the first left of the step budget: a
+// read that would fit a fresh deadline must fail closed on the shared one,
+// not get a deadline of its own.
 #[tokio::test]
 async fn post_actuation_read_inherits_the_spent_step_budget() {
-    // 450 ms deadline, 300 ms per read: the first fits with ~150 ms of
-    // scheduling slack, and the second inherits only the ~150 ms remainder —
-    // far short of its own 300 ms — so it fails closed on the shared budget.
-    // Both margins stay wide even on loaded CI runners.
-    let acquirer = Arc::new(
-        ScriptedAcquirer::new([fixtures::healthy_real(), fixtures::healthy_real()])
-            .with_delay(Duration::from_millis(300)),
-    );
+    // An injected deadline clock makes the shared-budget arithmetic exact:
+    // 1 s deadline. The first read gets the whole budget, then the test
+    // advances the clock so the second inherits only the last 50 ms — its
+    // worker is still parked on the hang gate when the shared deadline
+    // fires. Awaiting the worker's entry keeps the call count exact; no
+    // wall-clock deadline decides either outcome.
+    let base = Instant::now();
+    let spent_ms = Arc::new(AtomicU64::new(0));
+    let deadline_clock = {
+        let spent_ms = Arc::clone(&spent_ms);
+        move || base + Duration::from_millis(spent_ms.load(Ordering::SeqCst))
+    };
+    let acquirer = Arc::new(ScriptedAcquirer::new([
+        fixtures::healthy_real(),
+        fixtures::healthy_real(),
+    ]));
     let mut sup = harness().acquirer(acquirer.clone()).build();
-    sup.tick_deadline = Some(Instant::now() + Duration::from_millis(450));
+    sup.deadline_clock = Arc::new(deadline_clock);
+    sup.tick_deadline = Some(base + Duration::from_secs(1));
 
     let first = sup.acquire_raw_with_timeout().await;
+    // As if the first read plus scheduling spent 950 ms of the step: the
+    // second inherits only the 50 ms remainder, not a fresh deadline.
+    spent_ms.store(950, Ordering::SeqCst);
+    let (release, entered) = acquirer.hang_until_released();
     let second = sup.acquire_raw_with_timeout().await;
 
     assert_eq!(first.source, TelemetrySource::Nvml);
     assert_eq!(second.source, TelemetrySource::NvmlUnavailable);
+    // The second read did spawn its worker (proving the inherited budget
+    // was nonzero but insufficient); free it before the test ends.
+    entered.recv_timeout(Duration::from_secs(1)).unwrap();
+    acquirer.unhang();
+    release.send(()).unwrap();
     assert_eq!(acquirer.calls(), 2);
 }
 
