@@ -278,32 +278,6 @@ fn supervisor_config(cli: &Cli) -> SupervisorConfig {
     }
 }
 
-/// Build the step supervisor with all collaborators injected.
-fn build_supervisor(
-    cli: &Cli,
-    policy: SafetyPolicy,
-    actuator: Arc<dyn SafetyActuator>,
-    bridge: Arc<HardwareBridge>,
-    nvml_gate: NvmlGate,
-    relay_metrics: Arc<Mutex<RelayMetrics>>,
-) -> Supervisor {
-    Supervisor::new(
-        supervisor_config(cli),
-        SupervisorParts {
-            machine: SafetyMachine::with_policy(policy),
-            sample_clock: sample_clock_for(cli),
-            publisher: build_publisher(cli),
-            actuator,
-            acquirer: bridge,
-            gate: nvml_gate,
-            clock: Arc::new(unix_now_ms),
-            monotonic: monotonic_ms_clock(),
-            deadline_clock: Arc::new(Instant::now),
-            relay_metrics,
-        },
-    )
-}
-
 /// Run the supervisor using a lock retained by the caller through runtime shutdown.
 /// This is executable plumbing, not a reusable library API.
 #[doc(hidden)]
@@ -393,7 +367,20 @@ pub async fn run(prepared: &mut SupervisorStart) -> Result<(), Box<dyn std::erro
         );
     }
 
-    let mut supervisor = build_supervisor(cli, policy, actuator, bridge, nvml_gate, relay_metrics);
+    let mut supervisor = Supervisor::new(
+        supervisor_config(cli),
+        SupervisorParts {
+            machine: SafetyMachine::with_policy(policy),
+            sample_clock: sample_clock_for(cli),
+            publisher: build_publisher(cli),
+            actuator,
+            acquirer: bridge,
+            gate: nvml_gate,
+            clock: Arc::new(unix_now_ms),
+            monotonic: monotonic_ms_clock(),
+            relay_metrics,
+        },
+    );
     supervisor.seed_startup_brake(current_w, default_w);
 
     let shutdown_reason =
@@ -1148,7 +1135,6 @@ mod tests {
                 gate: NvmlGate::default(),
                 clock: Arc::new(unix_now_ms),
                 monotonic: monotonic_ms_clock(),
-                deadline_clock: Arc::new(Instant::now),
                 relay_metrics: Arc::clone(&relay_metrics),
             },
         );

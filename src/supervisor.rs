@@ -97,7 +97,6 @@ pub(crate) struct SupervisorParts {
     pub gate: NvmlGate,
     pub clock: Clock,
     pub monotonic: MonotonicClock,
-    pub deadline_clock: DeadlineClock,
     pub relay_metrics: Arc<Mutex<RelayMetrics>>,
 }
 
@@ -135,6 +134,9 @@ pub(crate) struct Supervisor {
     gate: NvmlGate,
     clock: Clock,
     monotonic: MonotonicClock,
+    /// Deadline source for the shared per-step acquisition budget. Production
+    /// is `Instant::now`; tests override it post-construction like
+    /// `tick_deadline`/`monotonic`.
     deadline_clock: DeadlineClock,
     relay_metrics: Arc<Mutex<RelayMetrics>>,
     warned_brake_held_sim: bool,
@@ -163,7 +165,7 @@ impl Supervisor {
             gate: parts.gate,
             clock: parts.clock,
             monotonic: parts.monotonic,
-            deadline_clock: parts.deadline_clock,
+            deadline_clock: Arc::new(Instant::now),
             relay_metrics: parts.relay_metrics,
             warned_brake_held_sim: false,
             warned_nvml_busy: false,
